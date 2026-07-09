@@ -12,7 +12,7 @@ Consumed by `marspi-cli` (and later platform services).
 | `graph` | StateGraph engine: nodes, edges, reducers, invoke/resume, interrupt |
 | `checkpoint` | Checkpointer interface + in-memory (SQLite later) |
 | `agentspec` | Named agent factory wrapping core.Runner + tool views |
-| `orchestrator` | Preset patterns: Pipeline, CodingLoop (Supervisor/Handoff later) |
+| `orchestrator` | Preset patterns: Pipeline, CodingLoop, Supervisor |
 
 ## P0.5 semantics (LangGraph subset)
 
