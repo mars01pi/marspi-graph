@@ -2,6 +2,7 @@ package graph_test
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/mars/marspi-graph/checkpoint"
@@ -194,5 +195,115 @@ func TestResumeFromMidRun(t *testing.T) {
 	}
 	if out.GetString("v") != "AB" {
 		t.Fatalf("got %q", out.GetString("v"))
+	}
+}
+
+func TestInterruptRequiresCheckpointer(t *testing.T) {
+	b := graph.NewBuilder()
+	b.AddNode("ask", func(ctx context.Context, s graph.State) (graph.Update, error) {
+		return nil, graph.Interrupt("need")
+	})
+	b.SetEntry("ask")
+	b.AddEdge("ask", graph.END)
+	g, err := b.Compile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = g.Invoke(context.Background(), graph.State{})
+	if err == nil || !strings.Contains(err.Error(), "requires a checkpointer") {
+		t.Fatalf("want checkpointer error, got %v", err)
+	}
+}
+
+func TestResumeInterruptedWithoutCommand(t *testing.T) {
+	cp := checkpoint.NewMemory()
+	b := graph.NewBuilder()
+	b.AddNode("ask", func(ctx context.Context, s graph.State) (graph.Update, error) {
+		v, err := graph.InterruptOrResume(ctx, "need")
+		if err != nil {
+			return nil, err
+		}
+		return graph.Update{"v": v}, nil
+	})
+	b.SetEntry("ask")
+	b.AddEdge("ask", graph.END)
+	g, err := b.Compile(graph.WithCheckpointer(cp))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = g.Invoke(context.Background(), graph.State{}, graph.WithThreadID("hitl2"))
+	if !graph.IsInterrupted(err) {
+		t.Fatalf("want interrupt, got %v", err)
+	}
+	_, err = g.Resume(context.Background(), "hitl2")
+	if err == nil || !strings.Contains(err.Error(), "Resume") {
+		t.Fatalf("want resume command error, got %v", err)
+	}
+}
+
+func TestCommandUpdateAndGoto(t *testing.T) {
+	cp := checkpoint.NewMemory()
+	b := graph.NewBuilder()
+	b.AddNode("a", func(ctx context.Context, s graph.State) (graph.Update, error) {
+		return graph.Update{"v": "A"}, nil
+	})
+	b.AddNode("b", func(ctx context.Context, s graph.State) (graph.Update, error) {
+		return graph.Update{"v": s.GetString("v") + "B"}, nil
+	})
+	b.AddNode("c", func(ctx context.Context, s graph.State) (graph.Update, error) {
+		return graph.Update{"v": s.GetString("v") + "C"}, nil
+	})
+	b.SetEntry("a")
+	b.AddEdge("a", "b")
+	b.AddEdge("b", "c")
+	b.AddEdge("c", graph.END)
+
+	g, err := b.Compile(graph.WithCheckpointer(cp))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cp.Put(context.Background(), "cmd", graph.Snapshot{
+		ThreadID: "cmd",
+		Node:     "b",
+		State:    graph.State{"v": "A"},
+		Step:     1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	out, err := g.Resume(context.Background(), "cmd", graph.WithCommand(graph.Command{
+		Update: graph.Update{"v": "X"},
+		Goto:   "c",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.GetString("v") != "XC" {
+		t.Fatalf("got %q", out.GetString("v"))
+	}
+}
+
+func TestMaxSteps(t *testing.T) {
+	b := graph.NewBuilder()
+	b.AddNode("a", func(ctx context.Context, s graph.State) (graph.Update, error) {
+		return graph.Update{"n": stateIntTest(s) + 1}, nil
+	})
+	b.SetEntry("a")
+	b.AddEdge("a", "a") // self-loop
+	g, err := b.Compile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = g.Invoke(context.Background(), graph.State{}, graph.WithMaxSteps(3))
+	if err == nil || !strings.Contains(err.Error(), "max steps") {
+		t.Fatalf("want max steps error, got %v", err)
+	}
+}
+
+func stateIntTest(s graph.State) int {
+	switch v := s["n"].(type) {
+	case int:
+		return v
+	default:
+		return 0
 	}
 }

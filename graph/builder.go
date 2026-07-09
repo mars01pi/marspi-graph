@@ -239,7 +239,10 @@ func (g *Compiled) Resume(ctx context.Context, threadID string, opts ...RunOptio
 		return state, nil
 	}
 
-	if snap.Interrupt && cfg.command != nil && cfg.command.Resume != nil {
+	if snap.Interrupt {
+		if cfg.command == nil || cfg.command.Resume == nil {
+			return state, fmt.Errorf("graph: interrupted at %q; resume requires WithCommand(Command{Resume: ...})", node)
+		}
 		ctx = WithResumeValue(ctx, cfg.command.Resume)
 	}
 
@@ -259,17 +262,18 @@ func (g *Compiled) run(ctx context.Context, state State, node string, step int, 
 		upd, err := fn(ctx, state)
 		if ie, ok := AsInterrupt(err); ok {
 			ie.Node = node
-			if g.checkpointer != nil {
-				if putErr := g.checkpointer.Put(ctx, cfg.threadID, Snapshot{
-					ThreadID:       cfg.threadID,
-					Node:           node, // re-enter same node on Resume
-					State:          state.Clone(),
-					Step:           step,
-					Interrupt:      true,
-					InterruptValue: ie.Value,
-				}); putErr != nil {
-					return state, putErr
-				}
+			if g.checkpointer == nil {
+				return state, fmt.Errorf("graph: interrupt at %q requires a checkpointer: %w", node, ie)
+			}
+			if putErr := g.checkpointer.Put(ctx, cfg.threadID, Snapshot{
+				ThreadID:       cfg.threadID,
+				Node:           node, // re-enter same node on Resume
+				State:          state.Clone(),
+				Step:           step,
+				Interrupt:      true,
+				InterruptValue: ie.Value,
+			}); putErr != nil {
+				return state, putErr
 			}
 			return state, ie
 		}
