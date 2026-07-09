@@ -2,6 +2,7 @@ package agentspec
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/mars/marspi-core/agent"
 	"github.com/mars/marspi-core/agentctx"
@@ -57,7 +58,11 @@ func New(spec Spec) *Instance {
 		MaxIter:    spec.MaxIter,
 		Stream:     spec.Stream,
 	}
-	mgr := agentctx.New(spec.MaxContext, spec.Provider, nil, spec.Reporter)
+	schemas := []map[string]any(nil)
+	if reg != nil {
+		schemas = reg.Schemas()
+	}
+	mgr := agentctx.New(spec.MaxContext, spec.Provider, schemas, spec.Reporter)
 	if spec.SystemPrompt != "" {
 		mgr.AppendSystem(spec.SystemPrompt)
 	}
@@ -67,19 +72,19 @@ func New(spec Spec) *Instance {
 // ID returns the agent id.
 func (a *Instance) ID() string { return a.spec.ID }
 
-// RunOnce appends userInput, runs the ReAct loop, and returns the last assistant/tool completion text.
-func (a *Instance) RunOnce(ctx context.Context, userInput string) string {
-	schemas := []map[string]any(nil)
-	if a.registry != nil {
-		schemas = a.registry.Schemas()
+// Manager exposes the private conversation (for tests / advanced presets).
+func (a *Instance) Manager() *agentctx.Manager { return a.ctx }
+
+// RunOnce appends userInput, runs the ReAct loop, and returns the last completion text.
+func (a *Instance) RunOnce(ctx context.Context, userInput string) (string, error) {
+	if err := a.runner.LoopCtx(ctx, a.ctx, "", userInput); err != nil {
+		return lastCompletion(a.ctx), err
 	}
-	// Refresh tools on manager for compact paths.
-	_ = schemas
-	a.runner.LoopCtx(ctx, a.ctx, "", userInput)
-	return lastCompletion(a.ctx)
+	return lastCompletion(a.ctx), nil
 }
 
-// AsNode returns a graph node that reads State["input"] (or key) and writes State["output"].
+// AsNode returns a graph node that reads State[inputKey] and writes State[outputKey].
+// Agent failures surface as node errors.
 func (a *Instance) AsNode(inputKey, outputKey string) graph.NodeFunc {
 	if inputKey == "" {
 		inputKey = "input"
@@ -89,7 +94,10 @@ func (a *Instance) AsNode(inputKey, outputKey string) graph.NodeFunc {
 	}
 	return func(ctx context.Context, s graph.State) (graph.Update, error) {
 		in := s.GetString(inputKey)
-		out := a.RunOnce(ctx, in)
+		out, err := a.RunOnce(ctx, in)
+		if err != nil {
+			return nil, fmt.Errorf("agentspec %q: %w", a.spec.ID, err)
+		}
 		return graph.Update{
 			outputKey:    out,
 			"last_agent": a.spec.ID,

@@ -28,4 +28,6 @@ state that multiple agent nodes can read/write across super-steps.
 
 - Clear ownership: conversation quality stays in core; orchestration in graph.
 - Agents can use different models/tools without sharing one message list.
-- Time-travel resumes the graph; replaying an agent turn re-runs the node.
+- Time-travel resumes the **graph** cursor and State; replaying an agent
+  turn re-runs the node with a fresh `agentctx` unless a future AgentStore
+  exists. See ADR 0004 (Resume scope).

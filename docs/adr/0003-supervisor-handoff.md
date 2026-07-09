@@ -68,3 +68,10 @@ Supervisor:  START → Supervisor ⇄ {A,B,C} → END
 - CLI exposes `/supervise` without replacing `/loop` or `/loopg`.
 - Future tool-based handoff can write the same State keys without changing
   worker node contracts.
+
+## Future work (deferred)
+
+v1 supervisor routing uses free-text JSON + parse/retry. That is intentionally
+MVP-only. Prefer later: handoff via **tool calling** (or provider structured
+output), plus enum validation of `next`. Tracked in [`docs/TODO.md`](../TODO.md)
+as **P2 — Supervisor reliable routing**; not scheduled.

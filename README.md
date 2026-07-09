@@ -17,10 +17,11 @@ Consumed by `marspi-cli` (and later platform services).
 ## P0.5 semantics (LangGraph subset)
 
 - **Reducers**: `AddReducer(key, fn)` — default last-write-wins; `AppendSlice` for lists
-- **Resume**: `Compiled.Resume(threadID)` continues from latest checkpoint
+- **Resume**: `Compiled.Resume(threadID)` continues from latest **graph** checkpoint (State + cursor). It does **not** restore per-agent chat memory — see ADR 0004.
 - **Interrupt**: node returns `graph.Interrupt(v)` / `InterruptOrResume`; resume with `WithCommand(Command{Resume: ...})`
 
-See `docs/adr/0002-langgraph-parity.md`.
+See `docs/adr/0002-langgraph-parity.md`, `docs/adr/0003-supervisor-handoff.md`, `docs/adr/0004-resume-scope.md`.
+Deferred work: `docs/TODO.md`.
 
 ## Dependency rule
 
