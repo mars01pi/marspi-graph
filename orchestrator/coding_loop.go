@@ -2,19 +2,23 @@ package orchestrator
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/mars/marspi-core/agent"
 	"github.com/mars/marspi-core/agentctx"
 	"github.com/mars/marspi-core/console"
 	"github.com/mars/marspi-core/llm"
 	"github.com/mars/marspi-core/tool"
+	"github.com/mars/marspi-graph/agentspec"
 	"github.com/mars/marspi-graph/checkpoint"
 	"github.com/mars/marspi-graph/graph"
 )
 
 // CodingLoopConfig configures the Implementer → Verifier → Updater workflow.
+// Invoke-oriented: graph Resume does not restore implementer agentctx (ADR 0004).
 type CodingLoopConfig struct {
 	Goal         string
 	MaxIter      int
@@ -26,6 +30,7 @@ type CodingLoopConfig struct {
 	MaxContext   int
 	MaxIterAgent int
 	Stream       bool
+	ThreadID     string // empty → coding-loop-<unixnano>
 }
 
 // CodingLoopResult is the outcome of a coding loop run.
@@ -37,8 +42,12 @@ type CodingLoopResult struct {
 }
 
 // RunCodingLoop executes the classic 3-role coding loop on a StateGraph.
-// Implementer conversation persists across iterations; verifier/updater are fresh each time.
+// Implementer conversation persists across iterations within one Invoke;
+// verifier/updater are fresh each time. See ADR 0004 for Resume limits.
 func RunCodingLoop(ctx context.Context, cfg CodingLoopConfig) (CodingLoopResult, error) {
+	if cfg.Provider == nil {
+		return CodingLoopResult{}, fmt.Errorf("orchestrator: coding loop requires Provider")
+	}
 	if cfg.MaxIter <= 0 {
 		cfg.MaxIter = 5
 	}
@@ -54,9 +63,21 @@ func RunCodingLoop(ctx context.Context, cfg CodingLoopConfig) (CodingLoopResult,
 	if cfg.Events == nil {
 		cfg.Events = agent.NewEmitter()
 	}
+	if cfg.ThreadID == "" {
+		cfg.ThreadID = fmt.Sprintf("coding-loop-%d", time.Now().UnixNano())
+	}
 
-	impl := newRoleAgent(cfg, "implementer", nil)
-	impl.ctx.AppendSystem(cfg.SystemPrompt)
+	impl := agentspec.New(agentspec.Spec{
+		ID:           "implementer",
+		SystemPrompt: cfg.SystemPrompt,
+		Provider:     cfg.Provider,
+		Registry:     cfg.Registry,
+		MaxContext:   cfg.MaxContext,
+		MaxIter:      cfg.MaxIterAgent,
+		Stream:       cfg.Stream,
+		Reporter:     cfg.Reporter,
+		Events:       cfg.Events,
+	})
 
 	b := graph.NewBuilder()
 	b.AddNode("implementer", func(runCtx context.Context, s graph.State) (graph.Update, error) {
@@ -79,17 +100,28 @@ func RunCodingLoop(ctx context.Context, cfg CodingLoopConfig) (CodingLoopResult,
 				"7. Call `attempt_completion` tool when done.\n\n"+
 				"DO NOT run tests or verify your own code. That's the Verifier's job.",
 			iter, maxIter, goal)
-		impl.runner.LoopCtx(runCtx, impl.ctx, "", prompt)
+		if _, err := impl.RunOnce(runCtx, prompt); err != nil {
+			return nil, fmt.Errorf("implementer: %w", err)
+		}
 		return graph.Update{
-			"changed_files": changedFiles(impl.ctx),
+			"changed_files": changedFiles(impl.Manager()),
 			"iteration":     iter,
 			"last_agent":    "implementer",
 		}, nil
 	})
 
 	b.AddNode("verifier", func(runCtx context.Context, s graph.State) (graph.Update, error) {
-		ver := newRoleAgent(cfg, "verifier", nil)
-		ver.ctx.AppendSystem(cfg.SystemPrompt)
+		ver := agentspec.New(agentspec.Spec{
+			ID:           "verifier",
+			SystemPrompt: cfg.SystemPrompt,
+			Provider:     cfg.Provider,
+			Registry:     cfg.Registry,
+			MaxContext:   cfg.MaxContext,
+			MaxIter:      cfg.MaxIterAgent,
+			Stream:       cfg.Stream,
+			Reporter:     cfg.Reporter,
+			Events:       cfg.Events,
+		})
 		iter := stateInt(s, "iteration")
 		goal := s.GetString("goal")
 		files := s.GetString("changed_files")
@@ -110,8 +142,10 @@ func RunCodingLoop(ctx context.Context, cfg CodingLoopConfig) (CodingLoopResult,
 				"   - 'VERIFY: PASS, ISSUES: <list>'\n\n"+
 				"Explain at architecture-level (module/flow), not function-level.",
 			iter, goal, files)
-		ver.runner.LoopCtx(runCtx, ver.ctx, "", prompt)
-		result := completionResult(ver.ctx)
+		if _, err := ver.RunOnce(runCtx, prompt); err != nil {
+			return nil, fmt.Errorf("verifier: %w", err)
+		}
+		result := completionResult(ver.Manager())
 		passed := result != "" && strings.Contains(result, "VERIFY: PASS")
 		status := "failed"
 		if passed {
@@ -125,10 +159,19 @@ func RunCodingLoop(ctx context.Context, cfg CodingLoopConfig) (CodingLoopResult,
 	})
 
 	b.AddNode("updater", func(runCtx context.Context, s graph.State) (graph.Update, error) {
-		// Updater: read-only tools preferred
 		allow := []string{"read", "grep", "search", "use_skill", "search_memory", "attempt_completion"}
-		upd := newRoleAgent(cfg, "updater", allow)
-		upd.ctx.AppendSystem(cfg.SystemPrompt)
+		upd := agentspec.New(agentspec.Spec{
+			ID:           "updater",
+			SystemPrompt: cfg.SystemPrompt,
+			Provider:     cfg.Provider,
+			Registry:     cfg.Registry,
+			AllowTools:   allow,
+			MaxContext:   cfg.MaxContext,
+			MaxIter:      cfg.MaxIterAgent,
+			Stream:       cfg.Stream,
+			Reporter:     cfg.Reporter,
+			Events:       cfg.Events,
+		})
 		iter := stateInt(s, "iteration")
 		goal := s.GetString("goal")
 		verifyResult := s.GetString("verify_result")
@@ -144,10 +187,12 @@ func RunCodingLoop(ctx context.Context, cfg CodingLoopConfig) (CodingLoopResult,
 				"Output: a single prompt, 50-200 words, specific constraints.\n"+
 				"Call `attempt_completion` tool to return the refined prompt.",
 			iter, goal, verifyResult)
-		upd.runner.LoopCtx(runCtx, upd.ctx, "", prompt)
-		refined := completionResult(upd.ctx)
+		if _, err := upd.RunOnce(runCtx, prompt); err != nil {
+			return nil, fmt.Errorf("updater: %w", err)
+		}
+		refined := completionResult(upd.Manager())
 		if refined != "" {
-			impl.ctx.AppendUser(fmt.Sprintf("[Refined prompt from updater iter %d]\n%s", iter, refined))
+			impl.Manager().AppendUser(fmt.Sprintf("[Refined prompt from updater iter %d]\n%s", iter, refined))
 		}
 		nextIter := iter + 1
 		return graph.Update{
@@ -182,7 +227,7 @@ func RunCodingLoop(ctx context.Context, cfg CodingLoopConfig) (CodingLoopResult,
 		"max_iter":  cfg.MaxIter,
 		"iteration": 1,
 		"status":    "running",
-	}, graph.WithThreadID("coding-loop"), graph.WithMaxSteps(cfg.MaxIter*4+2))
+	}, graph.WithThreadID(cfg.ThreadID), graph.WithMaxSteps(cfg.MaxIter*4+2))
 	if err != nil {
 		return CodingLoopResult{}, err
 	}
@@ -198,36 +243,10 @@ func RunCodingLoop(ctx context.Context, cfg CodingLoopConfig) (CodingLoopResult,
 	}
 	return CodingLoopResult{
 		Success:    false,
-		Iterations: cfg.MaxIter,
+		Iterations: iters,
 		Message:    fmt.Sprintf("Loop failed after %d iterations", cfg.MaxIter),
 		State:      out,
 	}, nil
-}
-
-type roleAgent struct {
-	runner *agent.Runner
-	ctx    *agentctx.Manager
-}
-
-func newRoleAgent(cfg CodingLoopConfig, id string, allow []string) *roleAgent {
-	reg := cfg.Registry
-	if reg != nil && len(allow) > 0 {
-		reg = reg.View(allow)
-	}
-	schemas := []map[string]any(nil)
-	if reg != nil {
-		schemas = reg.Schemas()
-	}
-	runner := &agent.Runner{
-		Provider:   cfg.Provider,
-		Registry:   reg,
-		Events:     cfg.Events,
-		MaxContext: cfg.MaxContext,
-		MaxIter:    cfg.MaxIterAgent,
-		Stream:     cfg.Stream,
-	}
-	mgr := agentctx.New(cfg.MaxContext, cfg.Provider, schemas, cfg.Reporter)
-	return &roleAgent{runner: runner, ctx: mgr}
 }
 
 func stateInt(s graph.State, key string) int {
@@ -243,27 +262,60 @@ func stateInt(s graph.State, key string) int {
 	}
 }
 
+// changedFiles extracts paths from assistant tool_calls for edit/write.
 func changedFiles(ctx *agentctx.Manager) string {
 	seen := map[string]bool{}
 	var files []string
 	for _, m := range ctx.Messages {
-		if r, _ := m["role"].(string); r != "tool" {
+		if r, _ := m["role"].(string); r != "assistant" {
 			continue
 		}
-		tn, _ := m["tool_name"].(string)
-		if tn != "edit" && tn != "write" {
+		tcs, ok := m["tool_calls"].([]any)
+		if !ok {
 			continue
 		}
-		content := contentStr(m["content"])
-		if !seen[content] {
-			seen[content] = true
-			files = append(files, content)
+		for _, raw := range tcs {
+			tc, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			fn, _ := tc["function"].(map[string]any)
+			if fn == nil {
+				continue
+			}
+			name, _ := fn["name"].(string)
+			if name != "edit" && name != "write" {
+				continue
+			}
+			path := pathFromToolArgs(fn["arguments"])
+			if path == "" || seen[path] {
+				continue
+			}
+			seen[path] = true
+			files = append(files, path)
 		}
 	}
 	if len(files) == 0 {
 		return "(unknown — Verifier inspect project to find)"
 	}
 	return strings.Join(files, ",\n ")
+}
+
+func pathFromToolArgs(args any) string {
+	switch a := args.(type) {
+	case string:
+		var m map[string]any
+		if err := json.Unmarshal([]byte(a), &m); err != nil {
+			return ""
+		}
+		p, _ := m["path"].(string)
+		return p
+	case map[string]any:
+		p, _ := a["path"].(string)
+		return p
+	default:
+		return ""
+	}
 }
 
 func completionResult(ctx *agentctx.Manager) string {

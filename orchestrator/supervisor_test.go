@@ -62,7 +62,7 @@ func TestRunSupervisorRoutesAndFinishes(t *testing.T) {
 }
 
 func TestRunSupervisorUnknownWorkerEnds(t *testing.T) {
-	res, err := orchestrator.RunSupervisor(context.Background(), orchestrator.SupervisorConfig{
+	_, err := orchestrator.RunSupervisor(context.Background(), orchestrator.SupervisorConfig{
 		Goal: "x",
 		Decide: func(context.Context, graph.State) (orchestrator.Decision, error) {
 			return orchestrator.Decision{Next: "ghost", Reason: "bad"}, nil
@@ -73,11 +73,8 @@ func TestRunSupervisorUnknownWorkerEnds(t *testing.T) {
 			}},
 		},
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if res.State.GetString("error") == "" {
-		t.Fatalf("expected error in state: %+v", res.State)
+	if err == nil {
+		t.Fatal("expected error for unknown worker")
 	}
 }
 

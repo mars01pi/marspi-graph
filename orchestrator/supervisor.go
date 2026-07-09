@@ -7,10 +7,10 @@ import (
 	"time"
 
 	"github.com/mars/marspi-core/agent"
-	"github.com/mars/marspi-core/agentctx"
 	"github.com/mars/marspi-core/console"
 	"github.com/mars/marspi-core/llm"
 	"github.com/mars/marspi-core/tool"
+	"github.com/mars/marspi-graph/agentspec"
 	"github.com/mars/marspi-graph/checkpoint"
 	"github.com/mars/marspi-graph/graph"
 )
@@ -31,6 +31,7 @@ type WorkerSpec struct {
 type DecideFunc func(ctx context.Context, s graph.State) (Decision, error)
 
 // SupervisorConfig configures a star-topology supervisor workflow.
+// Invoke-oriented: graph Resume does not restore worker agentctx (ADR 0004).
 type SupervisorConfig struct {
 	Goal         string
 	Workers      []WorkerSpec
@@ -43,8 +44,8 @@ type SupervisorConfig struct {
 	MaxContext   int
 	MaxIterAgent int
 	Stream       bool
-	ThreadID     string
-	Decide       DecideFunc // optional; for tests or custom routers
+	ThreadID     string // empty → supervisor-<unixnano>
+	Decide       DecideFunc
 }
 
 // SupervisorResult is the outcome of a supervisor run.
@@ -77,7 +78,7 @@ func RunSupervisor(ctx context.Context, cfg SupervisorConfig) (SupervisorResult,
 		cfg.Events = agent.NewEmitter()
 	}
 	if cfg.ThreadID == "" {
-		cfg.ThreadID = "supervisor"
+		cfg.ThreadID = fmt.Sprintf("supervisor-%d", time.Now().UnixNano())
 	}
 
 	workerSet := make(map[string]struct{}, len(cfg.Workers))
@@ -104,22 +105,14 @@ func RunSupervisor(ctx context.Context, cfg SupervisorConfig) (SupervisorResult,
 			}, nil
 		}
 
-		decision, err := decideNext(runCtx, cfg, s, workerSet)
+		decision, err := decideNext(runCtx, cfg, s)
 		if err != nil {
-			return graph.Update{
-				"next":       graph.END,
-				"error":      err.Error(),
-				"last_agent": supervisorNode,
-			}, nil
+			return nil, fmt.Errorf("supervisor decide: %w", err)
 		}
 		next := NormalizeNext(decision.Next)
 		if next != graph.END {
 			if _, ok := workerSet[next]; !ok {
-				return graph.Update{
-					"next":       graph.END,
-					"error":      fmt.Sprintf("unknown worker %q", decision.Next),
-					"last_agent": supervisorNode,
-				}, nil
+				return nil, fmt.Errorf("orchestrator: unknown worker %q", decision.Next)
 			}
 		}
 		task := decision.Task
@@ -161,8 +154,27 @@ func RunSupervisor(ctx context.Context, cfg SupervisorConfig) (SupervisorResult,
 				if cfg.Provider == nil {
 					return nil, fmt.Errorf("orchestrator: worker %q needs Provider or Run", w.ID)
 				}
-				inst := newWorkerAgent(cfg, w)
-				out = inst.RunOnce(runCtx, formatWorkerPrompt(w, s.GetString("goal"), task, s))
+				sys := w.SystemPrompt
+				if sys == "" {
+					sys = cfg.SystemPrompt
+				}
+				inst := agentspec.New(agentspec.Spec{
+					ID:           w.ID,
+					SystemPrompt: sys,
+					Provider:     cfg.Provider,
+					Registry:     cfg.Registry,
+					AllowTools:   w.AllowTools,
+					MaxContext:   cfg.MaxContext,
+					MaxIter:      cfg.MaxIterAgent,
+					Stream:       cfg.Stream,
+					Reporter:     cfg.Reporter,
+					Events:       cfg.Events,
+				})
+				text, err := inst.RunOnce(runCtx, formatWorkerPrompt(w, s.GetString("goal"), task, s))
+				if err != nil {
+					return nil, fmt.Errorf("worker %q: %w", w.ID, err)
+				}
+				out = text
 			}
 			summary := fmt.Sprintf("[%s] %s", w.ID, truncate(out, 400))
 			return graph.Update{
@@ -201,14 +213,11 @@ func RunSupervisor(ctx context.Context, cfg SupervisorConfig) (SupervisorResult,
 	msg := out.GetString("last_output")
 	if msg == "" {
 		msg = "Supervisor finished"
-		if e := out.GetString("error"); e != "" {
-			msg = "Supervisor ended: " + e
-		}
 	}
 	return SupervisorResult{Message: msg, State: out}, nil
 }
 
-func decideNext(ctx context.Context, cfg SupervisorConfig, s graph.State, workers map[string]struct{}) (Decision, error) {
+func decideNext(ctx context.Context, cfg SupervisorConfig, s graph.State) (Decision, error) {
 	if cfg.Decide != nil {
 		return cfg.Decide(ctx, s)
 	}
@@ -226,7 +235,6 @@ func decideNext(ctx context.Context, cfg SupervisorConfig, s graph.State, worker
 		}
 		return ParseDecision(text2)
 	}
-	_ = workers
 	return d, nil
 }
 
@@ -286,58 +294,6 @@ func formatWorkerPrompt(w WorkerSpec, goal, task string, s graph.State) string {
 	}
 	b.WriteString("\n\nComplete the task. Be concise in your final answer.")
 	return b.String()
-}
-
-func newWorkerAgent(cfg SupervisorConfig, w WorkerSpec) *agentspecWorker {
-	sys := w.SystemPrompt
-	if sys == "" {
-		sys = cfg.SystemPrompt
-	}
-	reg := cfg.Registry
-	if reg != nil && len(w.AllowTools) > 0 {
-		reg = reg.View(w.AllowTools)
-	}
-	schemas := []map[string]any(nil)
-	if reg != nil {
-		schemas = reg.Schemas()
-	}
-	runner := &agent.Runner{
-		Provider:   cfg.Provider,
-		Registry:   reg,
-		Events:     cfg.Events,
-		MaxContext: cfg.MaxContext,
-		MaxIter:    cfg.MaxIterAgent,
-		Stream:     cfg.Stream,
-	}
-	mgr := agentctx.New(cfg.MaxContext, cfg.Provider, schemas, cfg.Reporter)
-	if sys != "" {
-		mgr.AppendSystem(sys)
-	}
-	return &agentspecWorker{runner: runner, ctx: mgr}
-}
-
-type agentspecWorker struct {
-	runner *agent.Runner
-	ctx    *agentctx.Manager
-}
-
-func (a *agentspecWorker) RunOnce(ctx context.Context, userInput string) string {
-	a.runner.LoopCtx(ctx, a.ctx, "", userInput)
-	return lastAssistantText(a.ctx)
-}
-
-func lastAssistantText(m *agentctx.Manager) string {
-	for i := len(m.Messages) - 1; i >= 0; i-- {
-		msg := m.Messages[i]
-		role, _ := msg["role"].(string)
-		if role != "assistant" && role != "tool" {
-			continue
-		}
-		if c, ok := msg["content"].(string); ok && c != "" {
-			return c
-		}
-	}
-	return ""
 }
 
 func callLLMOnce(ctx context.Context, p llm.Provider, userText string) (string, error) {
