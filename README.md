@@ -9,10 +9,18 @@ Consumed by `marspi-cli` (and later platform services).
 
 | Package | Role |
 |---------|------|
-| `graph` | StateGraph engine: nodes, edges, compile, invoke/stream/resume |
-| `checkpoint` | Checkpointer interface + in-memory / SQLite backends |
+| `graph` | StateGraph engine: nodes, edges, reducers, invoke/resume, interrupt |
+| `checkpoint` | Checkpointer interface + in-memory (SQLite later) |
 | `agentspec` | Named agent factory wrapping core.Runner + tool views |
-| `orchestrator` | Preset patterns: Pipeline, Supervisor, Handoff |
+| `orchestrator` | Preset patterns: Pipeline, CodingLoop (Supervisor/Handoff later) |
+
+## P0.5 semantics (LangGraph subset)
+
+- **Reducers**: `AddReducer(key, fn)` — default last-write-wins; `AppendSlice` for lists
+- **Resume**: `Compiled.Resume(threadID)` continues from latest checkpoint
+- **Interrupt**: node returns `graph.Interrupt(v)` / `InterruptOrResume`; resume with `WithCommand(Command{Resume: ...})`
+
+See `docs/adr/0002-langgraph-parity.md`.
 
 ## Dependency rule
 

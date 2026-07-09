@@ -2,25 +2,28 @@ package graph
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 )
 
 // Builder constructs a StateGraph before Compile.
 type Builder struct {
-	mu     sync.Mutex
-	nodes  map[string]NodeFunc
-	edges  map[string]string // fixed: from -> to
-	routes map[string]RouteFunc
-	entry  string
+	mu       sync.Mutex
+	nodes    map[string]NodeFunc
+	edges    map[string]string // fixed: from -> to
+	routes   map[string]RouteFunc
+	reducers map[string]Reducer
+	entry    string
 }
 
 // NewBuilder creates an empty graph builder.
 func NewBuilder() *Builder {
 	return &Builder{
-		nodes:  map[string]NodeFunc{},
-		edges:  map[string]string{},
-		routes: map[string]RouteFunc{},
+		nodes:    map[string]NodeFunc{},
+		edges:    map[string]string{},
+		routes:   map[string]RouteFunc{},
+		reducers: map[string]Reducer{},
 	}
 }
 
@@ -38,6 +41,21 @@ func (b *Builder) AddNode(name string, fn NodeFunc) *Builder {
 		panic("graph: nil node func: " + name)
 	}
 	b.nodes[name] = fn
+	return b
+}
+
+// AddReducer registers a per-key merge function for state updates.
+// Keys without a reducer use last-write-wins.
+func (b *Builder) AddReducer(key string, r Reducer) *Builder {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if key == "" {
+		panic("graph: empty reducer key")
+	}
+	if r == nil {
+		panic("graph: nil reducer for " + key)
+	}
+	b.reducers[key] = r
 	return b
 }
 
@@ -118,11 +136,16 @@ func (b *Builder) Compile(opts ...CompileOption) (*Compiled, error) {
 	for k, v := range b.routes {
 		routes[k] = v
 	}
+	reducers := make(map[string]Reducer, len(b.reducers))
+	for k, v := range b.reducers {
+		reducers[k] = v
+	}
 
 	return &Compiled{
 		nodes:        nodes,
 		edges:        edges,
 		routes:       routes,
+		reducers:     reducers,
 		entry:        b.entry,
 		checkpointer: cfg.checkpointer,
 	}, nil
@@ -148,11 +171,12 @@ type Checkpointer interface {
 
 // Snapshot is one checkpoint of graph execution.
 type Snapshot struct {
-	ThreadID  string
-	Node      string // next node to run (or END)
-	State     State
-	Step      int
-	Interrupt bool
+	ThreadID       string
+	Node           string // next node to run (or current if Interrupt)
+	State          State
+	Step           int
+	Interrupt      bool
+	InterruptValue any
 }
 
 // Compiled is an immutable runnable graph.
@@ -160,8 +184,9 @@ type Compiled struct {
 	nodes        map[string]NodeFunc
 	edges        map[string]string
 	routes       map[string]RouteFunc
+	reducers     map[string]Reducer
 	entry        string
-	checkpointer Checkpointer
+	checkpointer  Checkpointer
 }
 
 // Invoke runs the graph to completion (or interrupt) starting from entry.
@@ -174,9 +199,54 @@ func (g *Compiled) Invoke(ctx context.Context, in State, opts ...RunOption) (Sta
 	if state == nil {
 		state = State{}
 	}
-	node := g.entry
-	step := 0
+	return g.run(ctx, state, g.entry, 0, cfg)
+}
 
+// Resume continues from the latest checkpoint for threadID.
+// Pass WithCommand to inject a resume value / state patch after interrupt.
+func (g *Compiled) Resume(ctx context.Context, threadID string, opts ...RunOption) (State, error) {
+	cfg := runConfig{threadID: "default"}
+	for _, o := range opts {
+		o(&cfg)
+	}
+	if threadID != "" {
+		cfg.threadID = threadID
+	}
+	if g.checkpointer == nil {
+		return nil, fmt.Errorf("graph: resume requires a checkpointer")
+	}
+	snap, ok, err := g.checkpointer.Get(ctx, cfg.threadID)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, fmt.Errorf("graph: no checkpoint for thread %q", cfg.threadID)
+	}
+
+	state := snap.State.Clone()
+	if state == nil {
+		state = State{}
+	}
+	if cfg.command != nil && cfg.command.Update != nil {
+		state = Apply(state, cfg.command.Update, g.reducers)
+	}
+
+	node := snap.Node
+	if cfg.command != nil && cfg.command.Goto != "" {
+		node = cfg.command.Goto
+	}
+	if node == "" || node == END {
+		return state, nil
+	}
+
+	if snap.Interrupt && cfg.command != nil && cfg.command.Resume != nil {
+		ctx = WithResumeValue(ctx, cfg.command.Resume)
+	}
+
+	return g.run(ctx, state, node, snap.Step, cfg)
+}
+
+func (g *Compiled) run(ctx context.Context, state State, node string, step int, cfg runConfig) (State, error) {
 	for node != "" && node != END {
 		if err := ctx.Err(); err != nil {
 			return state, err
@@ -185,12 +255,33 @@ func (g *Compiled) Invoke(ctx context.Context, in State, opts ...RunOption) (Sta
 		if !ok {
 			return state, fmt.Errorf("graph: unknown node %q", node)
 		}
+
 		upd, err := fn(ctx, state)
+		if ie, ok := AsInterrupt(err); ok {
+			ie.Node = node
+			if g.checkpointer != nil {
+				if putErr := g.checkpointer.Put(ctx, cfg.threadID, Snapshot{
+					ThreadID:       cfg.threadID,
+					Node:           node, // re-enter same node on Resume
+					State:          state.Clone(),
+					Step:           step,
+					Interrupt:      true,
+					InterruptValue: ie.Value,
+				}); putErr != nil {
+					return state, putErr
+				}
+			}
+			return state, ie
+		}
 		if err != nil {
 			return state, fmt.Errorf("graph: node %q: %w", node, err)
 		}
-		state = Apply(state, upd)
+
+		state = Apply(state, upd, g.reducers)
 		step++
+
+		// Clear one-shot resume value after a successful node re-entry.
+		ctx = context.WithValue(ctx, resumeCtxKey{}, nil)
 
 		next, err := g.next(ctx, node, state)
 		if err != nil {
@@ -198,10 +289,11 @@ func (g *Compiled) Invoke(ctx context.Context, in State, opts ...RunOption) (Sta
 		}
 		if g.checkpointer != nil {
 			if err := g.checkpointer.Put(ctx, cfg.threadID, Snapshot{
-				ThreadID: cfg.threadID,
-				Node:     next,
-				State:    state.Clone(),
-				Step:     step,
+				ThreadID:  cfg.threadID,
+				Node:      next,
+				State:     state.Clone(),
+				Step:      step,
+				Interrupt: false,
 			}); err != nil {
 				return state, err
 			}
@@ -237,6 +329,7 @@ func (g *Compiled) next(ctx context.Context, from string, s State) (string, erro
 type runConfig struct {
 	threadID string
 	maxSteps int
+	command  *Command
 }
 
 // RunOption configures a single Invoke/Resume.
@@ -254,4 +347,16 @@ func WithThreadID(id string) RunOption {
 // WithMaxSteps caps super-steps (0 = unlimited).
 func WithMaxSteps(n int) RunOption {
 	return func(c *runConfig) { c.maxSteps = n }
+}
+
+// WithCommand attaches a Resume command (resume value / update / goto).
+func WithCommand(cmd Command) RunOption {
+	return func(c *runConfig) {
+		c.command = &cmd
+	}
+}
+
+// IsInterrupted reports whether err is (or wraps) an interrupt.
+func IsInterrupted(err error) bool {
+	return errors.Is(err, ErrInterrupted)
 }
