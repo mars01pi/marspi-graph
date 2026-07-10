@@ -31,6 +31,8 @@ type CodingLoopConfig struct {
 	MaxIterAgent int
 	Stream       bool
 	ThreadID     string // empty → coding-loop-<unixnano>
+	// Checkpointer persists graph snapshots. nil → in-memory.
+	Checkpointer graph.Checkpointer
 }
 
 // CodingLoopResult is the outcome of a coding loop run.
@@ -217,7 +219,11 @@ func RunCodingLoop(ctx context.Context, cfg CodingLoopConfig) (CodingLoopResult,
 	})
 	b.AddEdge("updater", "implementer")
 
-	g, err := b.Compile(graph.WithCheckpointer(checkpoint.NewMemory()))
+	cp := cfg.Checkpointer
+	if cp == nil {
+		cp = checkpoint.NewMemory()
+	}
+	g, err := b.Compile(graph.WithCheckpointer(cp))
 	if err != nil {
 		return CodingLoopResult{}, err
 	}

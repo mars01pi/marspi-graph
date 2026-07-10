@@ -48,7 +48,7 @@ on **semantics**, keep ownership of the runtime, and integrate AgentSpec.
 | Capability | LangGraph | marspi after P0.5 |
 |------------|-----------|-------------------|
 | Node/edge/conditional | yes | yes |
-| Checkpoint write | yes | yes (Memory; backends later) |
+| Checkpoint write | yes | yes (Memory + SQLite latest-per-thread) |
 | Resume / time-travel | yes | Resume yes; time-travel later |
 | Interrupt + Command | yes | yes (minimal) |
 | Reducers | yes | yes (per-key) |

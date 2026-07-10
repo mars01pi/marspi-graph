@@ -16,7 +16,7 @@ Consumed by `marspi-cli` (and later platform services).
 | 包 | 角色 |
 |------|------|
 | [`graph`](./graph/) | **StateGraph 引擎**：节点、边、Reducer、Invoke/Resume、Interrupt |
-| [`checkpoint`](./checkpoint/) | **检查点接口**：In-Memory 实现（后续 SQLite） |
+| [`checkpoint`](./checkpoint/) | **检查点**：Memory + SQLite（每 thread 最新一条 Snapshot） |
 | [`agentspec`](./agentspec/) | **Agent 工厂**：包装 core.Runner + 工具视图，用于编排节点 |
 | [`orchestrator`](./orchestrator/) | **预设模式**：Pipeline、CodingLoop（三阶段循环）、Supervisor（星型编排） |
 
@@ -75,6 +75,17 @@ out, _ := g.Invoke(ctx, graph.State{"goal": "hello"})
 | `graph.Interrupt(v)` | 节点返回中断信号，暂停执行等待外部输入 |
 | `Compiled.Resume(threadID)` | 从最新 **graph** 检查点继续执行（不会恢复 agent chat 记忆 — 见 ADR 0004） |
 | `WithCommand(Command{Resume: …})` | 恢复时注入外部数据 |
+| `checkpoint.OpenSQLite(path)` | 文件持久化；跨进程 Resume 需同一拓扑重新 Compile |
+
+```go
+cp, _ := checkpoint.OpenSQLite("checkpoints.db")
+defer cp.Close()
+g, _ := b.Compile(graph.WithCheckpointer(cp))
+// … Invoke / interrupt …
+out, _ = g.Resume(ctx, threadID, graph.WithCommand(graph.Command{Resume: true}))
+```
+
+Supervisor / CodingLoop 可通过 `Checkpointer` 字段注入；`ResumeFromCheckpoint` 跳过 Invoke 直接续跑。
 
 ---
 
@@ -170,15 +181,17 @@ marspi-graph/
 │   ├── state.go              # State 类型
 │   ├── command.go            # Interrupt/Resume 命令
 │   └── interrupt.go          # 中断原语
-├── checkpoint/               # 检查点接口
-│   └── memory.go             # In-Memory 实现
+├── checkpoint/               # 检查点
+│   ├── memory.go             # In-Memory
+│   └── sqlite.go             # SQLite（latest-per-thread）
 ├── agentspec/                # Agent 工厂
 │   └── spec.go               # AgentSpec：包装 Runner 为可编排节点
 ├── orchestrator/             # 预设编排模式
 │   ├── pipeline.go           # Pipeline — 线性流水线
 │   ├── coding_loop.go        # CodingLoop — 三阶段编码循环
 │   ├── supervisor.go         # Supervisor — 星型多 Agent 编排
-│   └── handoff.go            # Handoff 协议（Decide/ParseDecision）
+│   ├── handoff.go            # Handoff 协议
+│   └── handoff_tool.go       # Supervisor 可靠路由（handoff tool）
 └── docs/adr/                 # 架构决策记录
     ├── 0001-state-and-agent-boundary.md
     ├── 0002-langgraph-parity.md

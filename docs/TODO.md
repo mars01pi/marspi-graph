@@ -11,6 +11,7 @@
 | done | CLI cancel ctx + unique ThreadID | Esc stops /loopg /supervise |
 | done | CLI HITL on Supervisor coder handoff | `RequireApprovalFor` + `OnInterrupt` + Confirm |
 | done | Supervisor reliable routing (handoff tool-call) | `handoff(to,reason,task)` enum; no prose JSON |
+| done | SQLite checkpointer (latest-per-thread) | `checkpoint.OpenSQLite`; inject via SupervisorConfig |
 | later | AgentStore (persist agentctx per node) | Needed for true HITL chat resume |
 
 ## Deferred product work
@@ -18,7 +19,7 @@
 | Priority | Item | Notes |
 |----------|------|-------|
 | — | Parallel / Send fan-out | Needs reducer-safe executor (ADR 0002) |
-| — | SQLite checkpointer | Memory is fine for CLI demos |
+| — | Checkpoint history / time-travel | SQLite currently latest-only (Memory-compatible) |
 | — | Per-worker `transfer_to_*` tools | Equivalent to single `handoff(to=…)` already shipped |
 | — | Tool-based `transfer_to_*` as alternate handoff UX | Related to reliable routing above |
 

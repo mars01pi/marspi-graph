@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/mars/marspi-graph/checkpoint"
 	"github.com/mars/marspi-graph/graph"
 	"github.com/mars/marspi-graph/orchestrator"
 )
@@ -177,6 +179,79 @@ func TestRunSupervisorHITLNoHookBubblesInterrupt(t *testing.T) {
 	})
 	if !graph.IsInterrupted(err) {
 		t.Fatalf("want interrupt, got %v", err)
+	}
+}
+
+func TestRunSupervisorSQLiteCrossProcessResume(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sv.db")
+	threadID := "sv-cross-proc"
+	workers := []orchestrator.WorkerSpec{
+		{
+			ID: "coder",
+			Run: func(_ context.Context, s graph.State, task string) (string, error) {
+				return "patched", nil
+			},
+		},
+	}
+	decide := func(context.Context, graph.State) (orchestrator.Decision, error) {
+		return orchestrator.Decision{Next: "coder", Reason: "r", Task: "patch"}, nil
+	}
+
+	cp1, err := checkpoint.OpenSQLite(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = orchestrator.RunSupervisor(context.Background(), orchestrator.SupervisorConfig{
+		Goal:               "edit",
+		MaxSteps:           6,
+		ThreadID:           threadID,
+		Checkpointer:       cp1,
+		RequireApprovalFor: []string{"coder"},
+		Decide:             decide,
+		Workers:            workers,
+		// No OnInterrupt → interrupt bubbles; checkpoint remains.
+	})
+	if !graph.IsInterrupted(err) {
+		t.Fatalf("want interrupt, got %v", err)
+	}
+	_ = cp1.Close()
+
+	// Simulate new process: reopen DB and resume with approval.
+	cp2, err := checkpoint.OpenSQLite(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cp2.Close()
+
+	var interruptCalls, decideCalls int
+	res, err := orchestrator.RunSupervisor(context.Background(), orchestrator.SupervisorConfig{
+		Goal:                 "edit",
+		MaxSteps:             6,
+		ThreadID:             threadID,
+		Checkpointer:         cp2,
+		ResumeFromCheckpoint: true,
+		RequireApprovalFor:   []string{"coder"},
+		Decide: func(ctx context.Context, s graph.State) (orchestrator.Decision, error) {
+			decideCalls++
+			return orchestrator.Decision{Next: "END", Reason: "done"}, nil
+		},
+		OnInterrupt: func(context.Context, orchestrator.InterruptInfo) (bool, error) {
+			interruptCalls++
+			return true, nil
+		},
+		Workers: workers,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if interruptCalls != 1 {
+		t.Fatalf("interruptCalls=%d", interruptCalls)
+	}
+	if decideCalls < 1 {
+		t.Fatalf("decideCalls=%d", decideCalls)
+	}
+	if res.State.GetString("last_output") != "patched" {
+		t.Fatalf("last_output=%q", res.State.GetString("last_output"))
 	}
 }
 

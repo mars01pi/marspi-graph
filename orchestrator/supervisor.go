@@ -67,6 +67,11 @@ type SupervisorConfig struct {
 	// OnInterrupt handles graph interrupts. If nil and a gated worker interrupts,
 	// RunSupervisor returns the interrupt error to the caller.
 	OnInterrupt OnInterruptFunc
+	// Checkpointer persists graph snapshots. nil → in-memory (single process).
+	Checkpointer graph.Checkpointer
+	// ResumeFromCheckpoint skips Invoke and continues from the latest snapshot
+	// for ThreadID (requires a durable Checkpointer).
+	ResumeFromCheckpoint bool
 }
 
 // SupervisorResult is the outcome of a supervisor run.
@@ -239,7 +244,10 @@ func RunSupervisor(ctx context.Context, cfg SupervisorConfig) (SupervisorResult,
 		return next
 	})
 
-	cp := checkpoint.NewMemory()
+	cp := cfg.Checkpointer
+	if cp == nil {
+		cp = checkpoint.NewMemory()
+	}
 	g, err := b.Compile(graph.WithCheckpointer(cp))
 	if err != nil {
 		return SupervisorResult{}, err
@@ -249,12 +257,52 @@ func RunSupervisor(ctx context.Context, cfg SupervisorConfig) (SupervisorResult,
 		graph.WithThreadID(cfg.ThreadID),
 		graph.WithMaxSteps(cfg.MaxSteps*2 + 2),
 	}
-	out, err := g.Invoke(ctx, graph.State{
-		"goal":      cfg.Goal,
-		"max_steps": cfg.MaxSteps,
-		"step":      0,
-		"messages":  []any{},
-	}, runOpts...)
+
+	var out graph.State
+	if cfg.ResumeFromCheckpoint {
+		if cfg.Checkpointer == nil {
+			return SupervisorResult{}, fmt.Errorf("orchestrator: ResumeFromCheckpoint requires Checkpointer")
+		}
+		snap, ok, gerr := cp.Get(ctx, cfg.ThreadID)
+		if gerr != nil {
+			return SupervisorResult{}, gerr
+		}
+		if !ok {
+			return SupervisorResult{}, fmt.Errorf("orchestrator: no checkpoint for thread %q", cfg.ThreadID)
+		}
+		// Interrupted threads need an approval Command before re-entering the node.
+		if snap.Interrupt {
+			if cfg.OnInterrupt == nil {
+				return SupervisorResult{State: snap.State}, &graph.InterruptError{
+					Node:  snap.Node,
+					Value: snap.InterruptValue,
+				}
+			}
+			approve, herr := cfg.OnInterrupt(ctx, InterruptInfo{
+				ThreadID: cfg.ThreadID,
+				Node:     snap.Node,
+				Value:    snap.InterruptValue,
+			})
+			if herr != nil {
+				return SupervisorResult{State: snap.State}, herr
+			}
+			if !approve {
+				return SupervisorResult{State: snap.State, Message: "Approval denied"}, ErrApprovalDenied
+			}
+			out, err = g.Resume(ctx, cfg.ThreadID, append(runOpts, graph.WithCommand(graph.Command{
+				Resume: true,
+			}))...)
+		} else {
+			out, err = g.Resume(ctx, cfg.ThreadID, runOpts...)
+		}
+	} else {
+		out, err = g.Invoke(ctx, graph.State{
+			"goal":      cfg.Goal,
+			"max_steps": cfg.MaxSteps,
+			"step":      0,
+			"messages":  []any{},
+		}, runOpts...)
+	}
 
 	for graph.IsInterrupted(err) {
 		ie, _ := graph.AsInterrupt(err)
