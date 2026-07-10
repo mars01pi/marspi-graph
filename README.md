@@ -116,11 +116,17 @@ res, _ := orchestrator.RunSupervisor(ctx, orchestrator.SupervisorConfig{
         {ID: "researcher", Description: "Read/search code", AllowTools: []string{"read", "grep"}},
         {ID: "coder",      Description: "Edit files"},
     },
-    Provider: provider,
+    Provider:             provider,
+    RequireApprovalFor:   []string{"coder"}, // HITL gate before RunOnce
+    OnInterrupt: func(ctx context.Context, info orchestrator.InterruptInfo) (bool, error) {
+        return confirm(info), nil // approve → Resume; deny → ErrApprovalDenied
+    },
 })
 ```
 
-> 对应 `marspi-cli` 中 `/supervise` 命令。
+HITL：`RequireApprovalFor` 中的 worker 入口会 `Interrupt`；`OnInterrupt` 返回 true 时 `Resume(Command{Resume: true})` 再执行。审批的是 handoff，不恢复 agent 私聊（ADR 0004）。
+
+> 对应 `marspi-cli` 中 `/supervise`（派 `coder` 前会 Confirm）。
 
 #### 流程图
 

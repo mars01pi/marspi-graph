@@ -2,6 +2,7 @@ package orchestrator_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -75,6 +76,107 @@ func TestRunSupervisorUnknownWorkerEnds(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected error for unknown worker")
+	}
+}
+
+func TestRunSupervisorHITLApprove(t *testing.T) {
+	var decideCalls, workerCalls, interruptCalls int
+	res, err := orchestrator.RunSupervisor(context.Background(), orchestrator.SupervisorConfig{
+		Goal:               "edit something",
+		MaxSteps:           6,
+		RequireApprovalFor: []string{"coder"},
+		Decide: func(_ context.Context, s graph.State) (orchestrator.Decision, error) {
+			decideCalls++
+			if decideCalls == 1 {
+				return orchestrator.Decision{
+					Next:   "coder",
+					Reason: "need code change",
+					Task:   "patch file",
+				}, nil
+			}
+			return orchestrator.Decision{Next: "END", Reason: "done"}, nil
+		},
+		OnInterrupt: func(_ context.Context, info orchestrator.InterruptInfo) (bool, error) {
+			interruptCalls++
+			if info.Node != "coder" {
+				t.Fatalf("node=%q", info.Node)
+			}
+			m, ok := info.Value.(map[string]any)
+			if !ok || m["task"] != "patch file" {
+				t.Fatalf("payload=%#v", info.Value)
+			}
+			return true, nil
+		},
+		Workers: []orchestrator.WorkerSpec{
+			{
+				ID: "coder",
+				Run: func(_ context.Context, s graph.State, task string) (string, error) {
+					workerCalls++
+					return "patched", nil
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if interruptCalls != 1 {
+		t.Fatalf("interruptCalls=%d", interruptCalls)
+	}
+	if workerCalls != 1 {
+		t.Fatalf("workerCalls=%d", workerCalls)
+	}
+	if res.State.GetString("last_output") != "patched" {
+		t.Fatalf("last_output=%q", res.State.GetString("last_output"))
+	}
+}
+
+func TestRunSupervisorHITLDeny(t *testing.T) {
+	var workerCalls int
+	_, err := orchestrator.RunSupervisor(context.Background(), orchestrator.SupervisorConfig{
+		Goal:               "edit something",
+		MaxSteps:           4,
+		RequireApprovalFor: []string{"coder"},
+		Decide: func(context.Context, graph.State) (orchestrator.Decision, error) {
+			return orchestrator.Decision{Next: "coder", Reason: "r", Task: "t"}, nil
+		},
+		OnInterrupt: func(context.Context, orchestrator.InterruptInfo) (bool, error) {
+			return false, nil
+		},
+		Workers: []orchestrator.WorkerSpec{
+			{
+				ID: "coder",
+				Run: func(context.Context, graph.State, string) (string, error) {
+					workerCalls++
+					return "should not run", nil
+				},
+			},
+		},
+	})
+	if !errors.Is(err, orchestrator.ErrApprovalDenied) {
+		t.Fatalf("want ErrApprovalDenied, got %v", err)
+	}
+	if workerCalls != 0 {
+		t.Fatalf("worker should not run, calls=%d", workerCalls)
+	}
+}
+
+func TestRunSupervisorHITLNoHookBubblesInterrupt(t *testing.T) {
+	_, err := orchestrator.RunSupervisor(context.Background(), orchestrator.SupervisorConfig{
+		Goal:               "edit",
+		MaxSteps:           4,
+		RequireApprovalFor: []string{"coder"},
+		Decide: func(context.Context, graph.State) (orchestrator.Decision, error) {
+			return orchestrator.Decision{Next: "coder", Reason: "r", Task: "t"}, nil
+		},
+		Workers: []orchestrator.WorkerSpec{
+			{ID: "coder", Run: func(context.Context, graph.State, string) (string, error) {
+				return "x", nil
+			}},
+		},
+	})
+	if !graph.IsInterrupted(err) {
+		t.Fatalf("want interrupt, got %v", err)
 	}
 }
 

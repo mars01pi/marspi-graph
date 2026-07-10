@@ -4,6 +4,7 @@ package orchestrator
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -19,6 +20,9 @@ import (
 
 const supervisorNode = "supervisor"
 
+// ErrApprovalDenied is returned when HITL rejects a handoff to a gated worker.
+var ErrApprovalDenied = errors.New("orchestrator: approval denied")
+
 // WorkerSpec describes one worker agent under a supervisor.
 type WorkerSpec struct {
 	ID           string
@@ -31,6 +35,16 @@ type WorkerSpec struct {
 
 // DecideFunc chooses the next worker (or END). When nil, the supervisor LLM is used.
 type DecideFunc func(ctx context.Context, s graph.State) (Decision, error)
+
+// InterruptInfo is passed to OnInterrupt when a gated worker pauses for approval.
+type InterruptInfo struct {
+	ThreadID string
+	Node     string // worker id
+	Value    any    // payload map: worker, task, reason, goal
+}
+
+// OnInterruptFunc is a blocking HITL hook. Return approve=true to Resume.
+type OnInterruptFunc func(ctx context.Context, info InterruptInfo) (approve bool, err error)
 
 // SupervisorConfig configures a star-topology supervisor workflow.
 // Invoke-oriented: graph Resume does not restore worker agentctx (ADR 0004).
@@ -48,6 +62,11 @@ type SupervisorConfig struct {
 	Stream       bool
 	ThreadID     string // empty → supervisor-<unixnano>
 	Decide       DecideFunc
+	// RequireApprovalFor lists worker IDs that must be approved before RunOnce.
+	RequireApprovalFor []string
+	// OnInterrupt handles graph interrupts. If nil and a gated worker interrupts,
+	// RunSupervisor returns the interrupt error to the caller.
+	OnInterrupt OnInterruptFunc
 }
 
 // SupervisorResult is the outcome of a supervisor run.
@@ -92,6 +111,10 @@ func RunSupervisor(ctx context.Context, cfg SupervisorConfig) (SupervisorResult,
 			return SupervisorResult{}, fmt.Errorf("orchestrator: duplicate worker id %q", w.ID)
 		}
 		workerSet[w.ID] = struct{}{}
+	}
+	approvalSet := make(map[string]struct{}, len(cfg.RequireApprovalFor))
+	for _, id := range cfg.RequireApprovalFor {
+		approvalSet[id] = struct{}{}
 	}
 
 	b := graph.NewBuilder()
@@ -139,11 +162,30 @@ func RunSupervisor(ctx context.Context, cfg SupervisorConfig) (SupervisorResult,
 
 	for _, w := range cfg.Workers {
 		w := w
+		needApproval := false
+		if _, ok := approvalSet[w.ID]; ok {
+			needApproval = true
+		}
 		b.AddNode(w.ID, func(runCtx context.Context, s graph.State) (graph.Update, error) {
 			h := HandoffFromMap(s["handoff"])
 			task := h.Task
 			if task == "" {
 				task = s.GetString("goal")
+			}
+			if needApproval {
+				payload := map[string]any{
+					"worker": w.ID,
+					"task":   task,
+					"reason": h.Reason,
+					"goal":   s.GetString("goal"),
+				}
+				v, err := graph.InterruptOrResume(runCtx, payload)
+				if err != nil {
+					return nil, err
+				}
+				if !approvalTruthy(v) {
+					return nil, ErrApprovalDenied
+				}
 			}
 			var out string
 			if w.Run != nil {
@@ -197,19 +239,52 @@ func RunSupervisor(ctx context.Context, cfg SupervisorConfig) (SupervisorResult,
 		return next
 	})
 
-	g, err := b.Compile(graph.WithCheckpointer(checkpoint.NewMemory()))
+	cp := checkpoint.NewMemory()
+	g, err := b.Compile(graph.WithCheckpointer(cp))
 	if err != nil {
 		return SupervisorResult{}, err
 	}
 
+	runOpts := []graph.RunOption{
+		graph.WithThreadID(cfg.ThreadID),
+		graph.WithMaxSteps(cfg.MaxSteps*2 + 2),
+	}
 	out, err := g.Invoke(ctx, graph.State{
 		"goal":      cfg.Goal,
 		"max_steps": cfg.MaxSteps,
 		"step":      0,
 		"messages":  []any{},
-	}, graph.WithThreadID(cfg.ThreadID), graph.WithMaxSteps(cfg.MaxSteps*2+2))
+	}, runOpts...)
+
+	for graph.IsInterrupted(err) {
+		ie, _ := graph.AsInterrupt(err)
+		if cfg.OnInterrupt == nil {
+			return SupervisorResult{State: out}, err
+		}
+		if cerr := ctx.Err(); cerr != nil {
+			return SupervisorResult{State: out}, cerr
+		}
+		info := InterruptInfo{
+			ThreadID: cfg.ThreadID,
+			Node:     ie.Node,
+			Value:    ie.Value,
+		}
+		approve, herr := cfg.OnInterrupt(ctx, info)
+		if herr != nil {
+			return SupervisorResult{State: out}, herr
+		}
+		if !approve {
+			return SupervisorResult{State: out, Message: "Approval denied"}, ErrApprovalDenied
+		}
+		if cerr := ctx.Err(); cerr != nil {
+			return SupervisorResult{State: out}, cerr
+		}
+		out, err = g.Resume(ctx, cfg.ThreadID, append(runOpts, graph.WithCommand(graph.Command{
+			Resume: true,
+		}))...)
+	}
 	if err != nil {
-		return SupervisorResult{}, err
+		return SupervisorResult{State: out}, err
 	}
 
 	msg := out.GetString("last_output")
@@ -217,6 +292,22 @@ func RunSupervisor(ctx context.Context, cfg SupervisorConfig) (SupervisorResult,
 		msg = "Supervisor finished"
 	}
 	return SupervisorResult{Message: msg, State: out}, nil
+}
+
+func approvalTruthy(v any) bool {
+	switch x := v.(type) {
+	case bool:
+		return x
+	case string:
+		switch strings.ToLower(strings.TrimSpace(x)) {
+		case "true", "yes", "y", "approve", "1":
+			return true
+		default:
+			return false
+		}
+	default:
+		return false
+	}
 }
 
 func decideNext(ctx context.Context, cfg SupervisorConfig, s graph.State) (Decision, error) {
