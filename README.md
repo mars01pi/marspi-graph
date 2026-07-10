@@ -124,6 +124,8 @@ res, _ := orchestrator.RunSupervisor(ctx, orchestrator.SupervisorConfig{
 })
 ```
 
+路由：Supervisor 默认通过 **handoff tool-call**（`to`/`reason`/`task`，`to` 为 worker∪{END} 枚举）决策，不解析正文 JSON。State 仍写 `next` / `handoff` / `messages`。
+
 HITL：`RequireApprovalFor` 中的 worker 入口会 `Interrupt`；`OnInterrupt` 返回 true 时 `Resume(Command{Resume: true})` 再执行。审批的是 handoff，不恢复 agent 私聊（ADR 0004）。
 
 > 对应 `marspi-cli` 中 `/supervise`（派 `coder` 前会 Confirm）。

@@ -314,19 +314,21 @@ func decideNext(ctx context.Context, cfg SupervisorConfig, s graph.State) (Decis
 	if cfg.Decide != nil {
 		return cfg.Decide(ctx, s)
 	}
+	allowed := workerAllowSet(cfg.Workers)
+	tools := handoffToolSchema(cfg.Workers)
 	prompt := buildSupervisorPrompt(cfg, s)
-	text, err := callLLMOnce(ctx, cfg.Provider, prompt)
+	resp, err := callLLMWithTools(ctx, cfg.Provider, prompt, tools)
 	if err != nil {
 		return Decision{}, err
 	}
-	d, err := ParseDecision(text)
+	d, err := DecisionFromToolCalls(resp, allowed)
 	if err != nil {
-		retry := prompt + "\n\nPrevious output was invalid. Reply with ONLY a JSON object: {\"next\":\"...\",\"reason\":\"...\",\"task\":\"...\"}"
-		text2, err2 := callLLMOnce(ctx, cfg.Provider, retry)
+		retry := prompt + "\n\nPrevious response was invalid. You MUST call the handoff tool (do not write JSON in the message body)."
+		resp2, err2 := callLLMWithTools(ctx, cfg.Provider, retry, tools)
 		if err2 != nil {
 			return Decision{}, err
 		}
-		return ParseDecision(text2)
+		return DecisionFromToolCalls(resp2, allowed)
 	}
 	return d, nil
 }
@@ -334,8 +336,8 @@ func decideNext(ctx context.Context, cfg SupervisorConfig, s graph.State) (Decis
 func buildSupervisorPrompt(cfg SupervisorConfig, s graph.State) string {
 	var b strings.Builder
 	b.WriteString("You are a Supervisor agent. Route work to specialist workers or finish.\n")
-	b.WriteString("Reply with ONLY a JSON object (no markdown):\n")
-	b.WriteString(`{"next":"<worker_id|END>","reason":"<short>","task":"<instructions for worker>"` + "}\n\n")
+	b.WriteString("You MUST call the handoff tool to choose the next worker (or END).\n")
+	b.WriteString("Do not write JSON or routing decisions in the message content.\n\n")
 	b.WriteString("Workers:\n")
 	for _, w := range cfg.Workers {
 		desc := w.Description
@@ -352,7 +354,7 @@ func buildSupervisorPrompt(cfg SupervisorConfig, s graph.State) string {
 		b.WriteString("\n\nLast worker output:\n")
 		b.WriteString(truncate(out, 1200))
 	}
-	b.WriteString("\n\nWhen the goal is satisfied, set next to END.")
+	b.WriteString("\n\nWhen the goal is satisfied, call handoff with to=END.")
 	return b.String()
 }
 
@@ -389,16 +391,15 @@ func formatWorkerPrompt(w WorkerSpec, goal, task string, s graph.State) string {
 	return b.String()
 }
 
-func callLLMOnce(ctx context.Context, p llm.Provider, userText string) (string, error) {
+func callLLMWithTools(ctx context.Context, p llm.Provider, userText string, tools []map[string]any) (llm.Response, error) {
 	msgs := []llm.Message{
 		{"role": "user", "content": userText},
 	}
-	raw, err := llm.RequestContext(ctx, p.APIURL(), p.BuildBody(msgs, nil), p.Headers(), 120*time.Second, 2)
+	raw, err := llm.RequestContext(ctx, p.APIURL(), p.BuildBody(msgs, tools), p.Headers(), 120*time.Second, 2)
 	if err != nil {
-		return "", err
+		return llm.Response{}, err
 	}
-	resp := p.ParseResponse(raw)
-	return strings.TrimSpace(resp.Content), nil
+	return p.ParseResponse(raw), nil
 }
 
 func truncate(s string, n int) string {

@@ -66,12 +66,19 @@ Supervisor:  START → Supervisor ⇄ {A,B,C} → END
 
 - CodingLoop stays as the static multi-role demo; Supervisor is additive.
 - CLI exposes `/supervise` without replacing `/loop` or `/loopg`.
-- Future tool-based handoff can write the same State keys without changing
-  worker node contracts.
+- Tool-call handoff writes the same State keys without changing worker
+  node contracts.
+
+## Routing evolution
+
+- **v1 (MVP):** free-text JSON + parse/retry (fragile).
+- **Current:** supervisor calls a single `handoff` tool with
+  `to`/`reason`/`task`; `to` is an enum of worker IDs + `END`. Prose
+  content is ignored for routing. Aligns with LangGraph / OpenAI Agents
+  handoff-as-tool practice. See [`docs/TODO.md`](../TODO.md).
 
 ## Future work (deferred)
 
-v1 supervisor routing uses free-text JSON + parse/retry. That is intentionally
-MVP-only. Prefer later: handoff via **tool calling** (or provider structured
-output), plus enum validation of `next`. Tracked in [`docs/TODO.md`](../TODO.md)
-as **P2 — Supervisor reliable routing**; not scheduled.
+- Per-worker `transfer_to_*` tools (equivalent naming to OpenAI/LangGraph).
+- Provider-native structured output as an alternate channel.
+- AgentStore for true HITL chat resume (ADR 0004).
