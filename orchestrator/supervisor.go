@@ -1,3 +1,5 @@
+// Package orchestrator provides high-level agent orchestration patterns.
+// Star-topology supervisor preset.
 package orchestrator
 
 import (
