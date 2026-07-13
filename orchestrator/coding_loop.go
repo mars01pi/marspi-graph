@@ -36,6 +36,10 @@ type CodingLoopConfig struct {
 	Checkpointer graph.Checkpointer
 	// Durable prefers history + implementer session persistence.
 	Durable graph.DurableCheckpointer
+	// Lease enables exclusive Invoke/Resume for ThreadID (requires fenced Durable).
+	Lease graph.ExecutionLease
+	// LeaseTTL overrides the default lease lifetime when Lease is set.
+	LeaseTTL time.Duration
 	// EventHandler receives graph lifecycle events for this run.
 	EventHandler graph.EventHandler
 	// ResumeFromCheckpoint skips Invoke and continues from latest snapshot.
@@ -234,7 +238,11 @@ func RunCodingLoop(ctx context.Context, cfg CodingLoopConfig) (CodingLoopResult,
 	compileOpts := []graph.CompileOption{}
 	if cfg.Durable != nil {
 		compileOpts = append(compileOpts, graph.WithDurableCheckpointer(cfg.Durable))
+		compileOpts = append(compileOpts, leaseCompileOpts(cfg.Lease, cfg.LeaseTTL)...)
 	} else {
+		if cfg.Lease != nil {
+			return CodingLoopResult{}, fmt.Errorf("orchestrator: Lease requires Durable checkpointer with fenced commit")
+		}
 		cp := cfg.Checkpointer
 		if cp == nil {
 			cp = checkpoint.NewMemory()

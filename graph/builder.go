@@ -103,6 +103,15 @@ func (b *Builder) Compile(opts ...CompileOption) (*Compiled, error) {
 		o(&cfg)
 	}
 
+	if cfg.lease != nil && cfg.durable != nil {
+		if _, ok := cfg.durable.(LeaseFencedCommitter); !ok {
+			return nil, fmt.Errorf("graph: ExecutionLease with durable store requires LeaseFencedCommitter")
+		}
+	}
+	if cfg.lease != nil && cfg.durable == nil && cfg.checkpointer != nil {
+		return nil, fmt.Errorf("graph: ExecutionLease requires durable checkpointer with fenced commit, not legacy Checkpointer")
+	}
+
 	if b.entry == "" {
 		return nil, fmt.Errorf("graph: entry node not set")
 	}
@@ -142,20 +151,35 @@ func (b *Builder) Compile(opts ...CompileOption) (*Compiled, error) {
 		reducers[k] = v
 	}
 
+	leaseTTL := cfg.leaseTTL
+	if leaseTTL <= 0 {
+		leaseTTL = DefaultLeaseTTL
+	}
+	releaseTO := cfg.leaseReleaseTimeout
+	if releaseTO <= 0 {
+		releaseTO = DefaultLeaseReleaseTimeout
+	}
+
 	return &Compiled{
-		nodes:        nodes,
-		edges:        edges,
-		routes:       routes,
-		reducers:     reducers,
-		entry:        b.entry,
-		checkpointer: cfg.checkpointer,
-		durable:      cfg.durable,
+		nodes:               nodes,
+		edges:               edges,
+		routes:              routes,
+		reducers:            reducers,
+		entry:               b.entry,
+		checkpointer:        cfg.checkpointer,
+		durable:             cfg.durable,
+		lease:               cfg.lease,
+		leaseTTL:            leaseTTL,
+		leaseReleaseTimeout: releaseTO,
 	}, nil
 }
 
 type compileConfig struct {
-	checkpointer Checkpointer
-	durable      DurableCheckpointer
+	checkpointer         Checkpointer
+	durable             DurableCheckpointer
+	lease               ExecutionLease
+	leaseTTL            time.Duration
+	leaseReleaseTimeout time.Duration
 }
 
 // CompileOption configures Compile.
@@ -170,6 +194,30 @@ func WithCheckpointer(cp Checkpointer) CompileOption {
 // When set, CommitStep/GetLatest are preferred over legacy Put/Get.
 func WithDurableCheckpointer(d DurableCheckpointer) CompileOption {
 	return func(c *compileConfig) { c.durable = d }
+}
+
+// WithExecutionLease enables exclusive Invoke/Resume for a thread.
+// When paired with a durable store, that store must implement LeaseFencedCommitter.
+func WithExecutionLease(l ExecutionLease) CompileOption {
+	return func(c *compileConfig) { c.lease = l }
+}
+
+// WithLeaseTTL sets the default lease lifetime (default 30s).
+func WithLeaseTTL(ttl time.Duration) CompileOption {
+	return func(c *compileConfig) {
+		if ttl > 0 {
+			c.leaseTTL = ttl
+		}
+	}
+}
+
+// WithLeaseReleaseTimeout bounds Release after run exit (default 3s).
+func WithLeaseReleaseTimeout(d time.Duration) CompileOption {
+	return func(c *compileConfig) {
+		if d > 0 {
+			c.leaseReleaseTimeout = d
+		}
+	}
 }
 
 // Checkpointer persists graph snapshots between super-steps (latest-only).
@@ -194,13 +242,16 @@ type Snapshot struct {
 
 // Compiled is an immutable runnable graph.
 type Compiled struct {
-	nodes        map[string]NodeFunc
-	edges        map[string]string
-	routes       map[string]RouteFunc
-	reducers     map[string]Reducer
-	entry        string
-	checkpointer Checkpointer
-	durable      DurableCheckpointer
+	nodes               map[string]NodeFunc
+	edges               map[string]string
+	routes              map[string]RouteFunc
+	reducers            map[string]Reducer
+	entry               string
+	checkpointer        Checkpointer
+	durable             DurableCheckpointer
+	lease               ExecutionLease
+	leaseTTL            time.Duration
+	leaseReleaseTimeout time.Duration
 }
 
 // Invoke runs the graph to completion (or interrupt) starting from entry.
@@ -210,11 +261,13 @@ func (g *Compiled) Invoke(ctx context.Context, in State, opts ...RunOption) (Sta
 	if state == nil {
 		state = State{}
 	}
-	ctx = g.enrichCtx(ctx, cfg, "")
-	g.emit(ctx, cfg, Event{Type: EventRunStart, Step: 0})
-	out, err := g.run(ctx, state, g.entry, 0, "", cfg)
-	g.emitRunEnd(ctx, cfg, err)
-	return out, err
+	return g.withLease(ctx, &cfg, func(ctx context.Context) (State, error) {
+		ctx = g.enrichCtx(ctx, cfg, "")
+		g.emit(ctx, cfg, Event{Type: EventRunStart, Step: 0})
+		out, err := g.run(ctx, state, g.entry, 0, "", cfg)
+		g.emitRunEnd(ctx, cfg, err)
+		return out, err
+	})
 }
 
 // Resume continues from the latest checkpoint for threadID.
@@ -227,46 +280,48 @@ func (g *Compiled) Resume(ctx context.Context, threadID string, opts ...RunOptio
 	if g.durable == nil && g.checkpointer == nil {
 		return nil, fmt.Errorf("graph: resume requires a checkpointer")
 	}
-	snap, ok, err := g.loadLatest(ctx, cfg.threadID)
-	if err != nil {
-		return nil, err
-	}
-	if !ok {
-		return nil, fmt.Errorf("graph: no checkpoint for thread %q", cfg.threadID)
-	}
-
-	state := snap.State.Clone()
-	if state == nil {
-		state = State{}
-	}
-	if cfg.command != nil && cfg.command.Update != nil {
-		state = Apply(state, cfg.command.Update, g.reducers)
-	}
-
-	node := snap.Node
-	if cfg.command != nil && cfg.command.Goto != "" {
-		node = cfg.command.Goto
-	}
-	if node == "" || node == END {
-		ctx = g.enrichCtx(ctx, cfg, snap.CheckpointID)
-		g.emit(ctx, cfg, Event{Type: EventRunResume, CheckpointID: snap.CheckpointID, Step: snap.Step})
-		g.emit(ctx, cfg, Event{Type: EventRunEnd, CheckpointID: snap.CheckpointID, Step: snap.Step, Metadata: map[string]string{"status": "completed"}})
-		return state, nil
-	}
-
-	if snap.Interrupt {
-		if cfg.command == nil || cfg.command.Resume == nil {
-			return state, fmt.Errorf("graph: interrupted at %q; resume requires WithCommand(Command{Resume: ...})", node)
+	return g.withLease(ctx, &cfg, func(ctx context.Context) (State, error) {
+		snap, ok, err := g.loadLatest(ctx, cfg.threadID)
+		if err != nil {
+			return nil, err
 		}
-		ctx = WithResumeValue(ctx, cfg.command.Resume)
-	}
+		if !ok {
+			return nil, fmt.Errorf("graph: no checkpoint for thread %q", cfg.threadID)
+		}
 
-	parentID := snap.CheckpointID
-	ctx = g.enrichCtx(ctx, cfg, parentID)
-	g.emit(ctx, cfg, Event{Type: EventRunResume, CheckpointID: parentID, NodeID: node, Step: snap.Step})
-	out, err := g.run(ctx, state, node, snap.Step, parentID, cfg)
-	g.emitRunEnd(ctx, cfg, err)
-	return out, err
+		state := snap.State.Clone()
+		if state == nil {
+			state = State{}
+		}
+		if cfg.command != nil && cfg.command.Update != nil {
+			state = Apply(state, cfg.command.Update, g.reducers)
+		}
+
+		node := snap.Node
+		if cfg.command != nil && cfg.command.Goto != "" {
+			node = cfg.command.Goto
+		}
+		if node == "" || node == END {
+			ctx = g.enrichCtx(ctx, cfg, snap.CheckpointID)
+			g.emit(ctx, cfg, Event{Type: EventRunResume, CheckpointID: snap.CheckpointID, Step: snap.Step})
+			g.emit(ctx, cfg, Event{Type: EventRunEnd, CheckpointID: snap.CheckpointID, Step: snap.Step, Metadata: map[string]string{"status": "completed"}})
+			return state, nil
+		}
+
+		if snap.Interrupt {
+			if cfg.command == nil || cfg.command.Resume == nil {
+				return state, fmt.Errorf("graph: interrupted at %q; resume requires WithCommand(Command{Resume: ...})", node)
+			}
+			ctx = WithResumeValue(ctx, cfg.command.Resume)
+		}
+
+		parentID := snap.CheckpointID
+		ctx = g.enrichCtx(ctx, cfg, parentID)
+		g.emit(ctx, cfg, Event{Type: EventRunResume, CheckpointID: parentID, NodeID: node, Step: snap.Step})
+		out, err := g.run(ctx, state, node, snap.Step, parentID, cfg)
+		g.emitRunEnd(ctx, cfg, err)
+		return out, err
+	})
 }
 
 func (g *Compiled) prepareRun(opts ...RunOption) runConfig {
@@ -276,6 +331,9 @@ func (g *Compiled) prepareRun(opts ...RunOption) runConfig {
 	}
 	if cfg.runID == "" {
 		cfg.runID = NewID()
+	}
+	if cfg.leaseTTL <= 0 {
+		cfg.leaseTTL = g.leaseTTL
 	}
 	return cfg
 }
@@ -287,7 +345,144 @@ func (g *Compiled) enrichCtx(ctx context.Context, cfg runConfig, parentCheckpoin
 	if cfg.events != nil {
 		ctx = withEventHandler(ctx, cfg.events)
 	}
+	if cfg.leaseSess != nil {
+		ctx = WithLeaseGrant(ctx, cfg.leaseSess.get())
+	}
 	return ctx
+}
+
+// withLease acquires an execution lease, runs body under a heartbeat, then releases.
+func (g *Compiled) withLease(ctx context.Context, cfg *runConfig, body func(context.Context) (State, error)) (State, error) {
+	if g.lease == nil {
+		return body(ctx)
+	}
+	ttl := cfg.leaseTTL
+	if ttl <= 0 {
+		ttl = g.leaseTTL
+	}
+	if ttl <= 0 {
+		ttl = DefaultLeaseTTL
+	}
+
+	grant, err := g.lease.Acquire(ctx, cfg.threadID, cfg.runID, ttl)
+	if err != nil {
+		return nil, err
+	}
+	cfg.leaseSess = &leaseSession{grant: grant}
+
+	runCtx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	runCtx = WithThreadIDCtx(runCtx, cfg.threadID)
+	runCtx = WithRunID(runCtx, cfg.runID)
+	if cfg.events != nil {
+		runCtx = withEventHandler(runCtx, cfg.events)
+	}
+	runCtx = WithLeaseGrant(runCtx, grant)
+
+	done := make(chan struct{})
+	go g.leaseHeartbeat(runCtx, cancel, cfg, ttl, done)
+
+	g.emit(runCtx, *cfg, Event{
+		Type: EventLeaseAcquired,
+		Metadata: map[string]string{
+			"epoch": fmt.Sprintf("%d", grant.Epoch),
+			"ttl":   ttl.String(),
+		},
+	})
+
+	out, err := body(runCtx)
+
+	cancel(nil)
+	<-done
+
+	status := "completed"
+	if err != nil {
+		if IsInterrupted(err) {
+			status = "paused"
+		} else if errors.Is(err, ErrLeaseLost) || errors.Is(context.Cause(runCtx), ErrLeaseLost) {
+			status = "lease_lost"
+		} else if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			status = "cancelled"
+		} else {
+			status = "error"
+		}
+	}
+	final := cfg.leaseSess.get()
+	g.emit(ctx, *cfg, Event{
+		Type: EventLeaseReleased,
+		Metadata: map[string]string{
+			"epoch":  fmt.Sprintf("%d", final.Epoch),
+			"status": status,
+		},
+	})
+
+	releaseTO := g.leaseReleaseTimeout
+	if releaseTO <= 0 {
+		releaseTO = DefaultLeaseReleaseTimeout
+	}
+	releaseCtx, releaseCancel := context.WithTimeout(context.WithoutCancel(ctx), releaseTO)
+	_ = g.lease.Release(releaseCtx, final)
+	releaseCancel()
+	return out, err
+}
+
+func (g *Compiled) leaseHeartbeat(runCtx context.Context, cancel context.CancelCauseFunc, cfg *runConfig, ttl time.Duration, done chan struct{}) {
+	defer close(done)
+	ticker := time.NewTicker(heartbeatInterval(ttl))
+	defer ticker.Stop()
+	for {
+		select {
+		case <-runCtx.Done():
+			return
+		case <-ticker.C:
+			grant := cfg.leaseSess.get()
+			next, err := g.lease.Renew(runCtx, grant, ttl)
+			if err != nil {
+				if runCtx.Err() != nil {
+					return
+				}
+				g.emit(runCtx, *cfg, Event{
+					Type: EventLeaseRenewFailed,
+					Err:  err,
+					Metadata: map[string]string{
+						"epoch": fmt.Sprintf("%d", grant.Epoch),
+						"class": leaseErrClass(err),
+					},
+				})
+				if errors.Is(err, ErrLeaseLost) {
+					cancel(ErrLeaseLost)
+				} else {
+					cancel(fmt.Errorf("%w: renew: %v", ErrLeaseLost, err))
+				}
+				return
+			}
+			cfg.leaseSess.set(next)
+		}
+	}
+}
+
+func heartbeatInterval(ttl time.Duration) time.Duration {
+	iv := ttl / 3
+	if iv <= 0 {
+		iv = time.Millisecond
+	}
+	if max := ttl / 2; max > 0 && iv >= max {
+		iv = max - time.Millisecond
+		if iv <= 0 {
+			iv = time.Millisecond
+		}
+	}
+	return iv
+}
+
+func leaseErrClass(err error) string {
+	if errors.Is(err, ErrLeaseLost) {
+		return "lost"
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return "canceled"
+	}
+	return "error"
 }
 
 func (g *Compiled) emitRunEnd(ctx context.Context, cfg runConfig, err error) {
@@ -295,6 +490,9 @@ func (g *Compiled) emitRunEnd(ctx context.Context, cfg runConfig, err error) {
 	if err != nil {
 		if IsInterrupted(err) {
 			meta["status"] = "paused"
+		} else if errors.Is(err, ErrLeaseLost) || errors.Is(context.Cause(ctx), ErrLeaseLost) {
+			meta["status"] = "lease_lost"
+			meta["error"] = FormatEventErr(err)
 		} else if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			meta["status"] = "cancelled"
 		} else {
@@ -313,13 +511,36 @@ func (g *Compiled) loadLatest(ctx context.Context, threadID string) (Snapshot, b
 }
 
 func (g *Compiled) persist(ctx context.Context, cfg runConfig, snap Snapshot, artifacts []StepArtifact) error {
+	if err := leaseLostFrom(ctx); err != nil {
+		return err
+	}
 	if g.durable != nil {
+		if g.lease != nil {
+			fc, ok := g.durable.(LeaseFencedCommitter)
+			if !ok {
+				return fmt.Errorf("graph: ExecutionLease with durable store requires LeaseFencedCommitter")
+			}
+			if cfg.leaseSess == nil {
+				return fmt.Errorf("graph: missing lease grant for fenced commit")
+			}
+			return fc.CommitStepFenced(ctx, snap, artifacts, cfg.leaseSess.get())
+		}
 		return g.durable.CommitStep(ctx, snap, artifacts)
 	}
 	if g.checkpointer != nil {
 		return g.checkpointer.Put(ctx, cfg.threadID, snap)
 	}
 	return fmt.Errorf("graph: no checkpointer")
+}
+
+func leaseLostFrom(ctx context.Context) error {
+	if cause := context.Cause(ctx); errors.Is(cause, ErrLeaseLost) {
+		return ErrLeaseLost
+	}
+	if err := ctx.Err(); err != nil && errors.Is(context.Cause(ctx), ErrLeaseLost) {
+		return ErrLeaseLost
+	}
+	return nil
 }
 
 func (g *Compiled) hasStore() bool {
@@ -329,6 +550,9 @@ func (g *Compiled) hasStore() bool {
 func (g *Compiled) run(ctx context.Context, state State, node string, step int, parentCheckpointID string, cfg runConfig) (State, error) {
 	parent := parentCheckpointID
 	for node != "" && node != END {
+		if err := leaseLostFrom(ctx); err != nil {
+			return state, err
+		}
 		if err := ctx.Err(); err != nil {
 			return state, err
 		}
@@ -339,11 +563,18 @@ func (g *Compiled) run(ctx context.Context, state State, node string, step int, 
 
 		nodeCtx := WithNodeID(ctx, node)
 		nodeCtx = WithParentCheckpointID(nodeCtx, parent)
+		if cfg.leaseSess != nil {
+			nodeCtx = WithLeaseGrant(nodeCtx, cfg.leaseSess.get())
+		}
 		nodeCtx, collector := WithStepArtifacts(nodeCtx)
 
 		g.emit(nodeCtx, cfg, Event{Type: EventNodeStart, NodeID: node, Step: step, CheckpointID: parent})
 
 		upd, err := fn(nodeCtx, state)
+		if lost := leaseLostFrom(ctx); lost != nil {
+			// Discard update/artifacts after heartbeat loss.
+			return state, lost
+		}
 		if ie, ok := AsInterrupt(err); ok {
 			ie.Node = node
 			if !g.hasStore() {
@@ -444,12 +675,31 @@ func (g *Compiled) next(ctx context.Context, from string, s State) (string, erro
 	return to, nil
 }
 
+type leaseSession struct {
+	mu    sync.Mutex
+	grant LeaseGrant
+}
+
+func (s *leaseSession) get() LeaseGrant {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.grant
+}
+
+func (s *leaseSession) set(g LeaseGrant) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.grant = g
+}
+
 type runConfig struct {
-	threadID string
-	maxSteps int
-	command  *Command
-	runID    string
-	events   EventHandler
+	threadID  string
+	maxSteps  int
+	command   *Command
+	runID     string // 实例id
+	events    EventHandler
+	leaseTTL  time.Duration
+	leaseSess *leaseSession
 }
 
 // RunOption configures a single Invoke/Resume.
@@ -479,6 +729,15 @@ func WithCommand(cmd Command) RunOption {
 // WithEventHandler attaches a per-run lifecycle event handler.
 func WithEventHandler(h EventHandler) RunOption {
 	return func(c *runConfig) { c.events = h }
+}
+
+// WithRunLeaseTTL overrides the compile-time lease TTL for one run.
+func WithRunLeaseTTL(ttl time.Duration) RunOption {
+	return func(c *runConfig) {
+		if ttl > 0 {
+			c.leaseTTL = ttl
+		}
+	}
 }
 
 // IsInterrupted reports whether err is (or wraps) an interrupt.

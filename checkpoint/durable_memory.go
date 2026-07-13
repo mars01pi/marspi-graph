@@ -62,6 +62,11 @@ func (m *DurableMemory) CommitStep(ctx context.Context, snap graph.Snapshot, art
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	return m.commitStepLocked(snap, artifacts)
+}
+
+// commitStepLocked appends under m.mu.
+func (m *DurableMemory) commitStepLocked(snap graph.Snapshot, artifacts []graph.StepArtifact) error {
 	t := m.threadLocked(snap.ThreadID)
 
 	// Idempotent retry: same id + matching parent/thread.

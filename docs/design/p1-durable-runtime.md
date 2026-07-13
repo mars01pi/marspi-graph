@@ -117,11 +117,15 @@ Correlation: `RunID`, `ThreadID`, `CheckpointID`, `NodeID`, `AgentID`. Core `age
 | 4a | Supervisor durable resume alignment |
 | 4b | CodingLoop Resume + implementer-only persistence |
 
-## Out of scope (P1.5+)
+## Out of scope (later)
 
 - SQLite history / SQLite→MySQL migration / Postgres
-- Distributed execution leases, HTTP idempotency, async event transport, SSE
+- HTTP idempotency, async event transport, SSE
 - Parallel/Send, subgraphs, cross-thread store
 - Embedding agentctx into Snapshot
 - LLM/tool iteration-level recovery
 - Time-travel Resume API
+
+Distributed execution leases are specified in
+[`p15-execution-lease.md`](./p15-execution-lease.md) (ADR 0008); implementation
+is tracked under P1.5 in `docs/TODO.md`.

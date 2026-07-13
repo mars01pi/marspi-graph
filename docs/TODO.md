@@ -30,13 +30,26 @@ ADRs: 0005 AgentStore, 0006 Checkpoint history, 0007 Graph events
 
 **MySQL integration tests:** set `MARSPI_MYSQL_DSN` to enable.
 
-## Deferred product work (P1.5+)
+## P1.5 Execution Lease
+
+Design: [`docs/design/p15-execution-lease.md`](./design/p15-execution-lease.md)
+ADR: [0008](./adr/0008-execution-lease.md)
+
+| Status | Item | Notes |
+|--------|------|-------|
+| done | Execution lease contract | Background heartbeat; monotonic epoch; pause releases |
+| done | `LeaseGrant` + `graph.ExecutionLease` + Memory impl | Whole-run heartbeat and cancellation |
+| done | MySQL lease migration + fenced commit | `lease_run_id` / `lease_epoch` / `lease_expires_at` |
+| done | Supervisor / CodingLoop lease wiring | `Lease` + `LeaseTTL` on configs |
+| done | Concurrency / HITL / fence tests | Memory default; MySQL opt-in via `MARSPI_MYSQL_DSN` |
+
+## Deferred product work (later)
 
 | Priority | Item | Notes |
 |----------|------|-------|
-| — | Distributed execution lease | Beyond parent CAS |
 | — | HTTP idempotent run API / SSE | Service surface |
 | — | Async event transport | Sync handler only in P1 |
 | — | Time-travel Resume API | History queryable in P1 |
 | — | Parallel / Send fan-out | Needs reducer-safe executor (ADR 0002) |
 | — | Per-worker `transfer_to_*` tools | Equivalent to single `handoff(to=…)` already shipped |
+| — | Redis ExecutionLease backend | Interface reserved in ADR 0008 |

@@ -62,7 +62,10 @@ func (m *MySQL) migrate(ctx context.Context) error {
 			thread_id VARCHAR(191) PRIMARY KEY COMMENT '执行线程 ID（一次 Invoke/Resume 会话）',
 			latest_checkpoint_id CHAR(32) NULL COMMENT '该线程当前最新 checkpoint_id',
 			latest_revision BIGINT NOT NULL DEFAULT 0 COMMENT '最新 checkpoint 的单调版本号',
-			updated_at DATETIME(6) NOT NULL COMMENT '线程指针最后更新时间（UTC）'
+			updated_at DATETIME(6) NOT NULL COMMENT '线程指针最后更新时间（UTC）',
+			lease_run_id CHAR(32) NULL COMMENT '当前租约 owner runID',
+			lease_epoch BIGINT NOT NULL DEFAULT 0 COMMENT '单调递增 fencing epoch，释放时不重置',
+			lease_expires_at DATETIME(6) NULL COMMENT '租约过期时间（MySQL UTC）'
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='图执行线程：维护 latest checkpoint 指针，供 CAS 与 Resume'`,
 
 		`CREATE TABLE IF NOT EXISTS graph_checkpoints (
@@ -119,6 +122,30 @@ func (m *MySQL) migrate(ctx context.Context) error {
 	_, err := m.db.ExecContext(ctx, `
 		INSERT IGNORE INTO schema_migrations (version, applied_at) VALUES (1, UTC_TIMESTAMP(6))
 	`)
+	if err != nil {
+		return err
+	}
+	return m.migrateLeaseV2(ctx)
+}
+
+func (m *MySQL) migrateLeaseV2(ctx context.Context) error {
+	alters := []string{
+		`ALTER TABLE graph_threads ADD COLUMN lease_run_id CHAR(32) NULL COMMENT '当前租约 owner runID'`,
+		`ALTER TABLE graph_threads ADD COLUMN lease_epoch BIGINT NOT NULL DEFAULT 0 COMMENT '单调递增 fencing epoch，释放时不重置'`,
+		`ALTER TABLE graph_threads ADD COLUMN lease_expires_at DATETIME(6) NULL COMMENT '租约过期时间（MySQL UTC）'`,
+	}
+	for _, q := range alters {
+		if _, err := m.db.ExecContext(ctx, q); err != nil {
+			var me *mysql.MySQLError
+			if errors.As(err, &me) && me.Number == 1060 { // Duplicate column
+				continue
+			}
+			return fmt.Errorf("checkpoint: mysql lease migrate: %w", err)
+		}
+	}
+	_, err := m.db.ExecContext(ctx, `
+		INSERT IGNORE INTO schema_migrations (version, applied_at) VALUES (2, UTC_TIMESTAMP(6))
+	`)
 	return err
 }
 
@@ -167,11 +194,23 @@ func mysqlCommentAlters() []string {
 
 // CommitStep appends a checkpoint and agent session artifacts in one transaction.
 func (m *MySQL) CommitStep(ctx context.Context, snap graph.Snapshot, artifacts []graph.StepArtifact) error {
+	return m.commitStep(ctx, snap, artifacts, nil)
+}
+
+// CommitStepFenced appends a checkpoint only while grant is still the active lease.
+func (m *MySQL) CommitStepFenced(ctx context.Context, snap graph.Snapshot, artifacts []graph.StepArtifact, grant graph.LeaseGrant) error {
+	return m.commitStep(ctx, snap, artifacts, &grant)
+}
+
+func (m *MySQL) commitStep(ctx context.Context, snap graph.Snapshot, artifacts []graph.StepArtifact, grant *graph.LeaseGrant) error {
 	if snap.ThreadID == "" {
 		return fmt.Errorf("checkpoint: CommitStep requires ThreadID")
 	}
 	if snap.CheckpointID == "" {
 		return fmt.Errorf("checkpoint: CommitStep requires CheckpointID")
+	}
+	if grant != nil && grant.ThreadID != "" && grant.ThreadID != snap.ThreadID {
+		return graph.ErrLeaseLost
 	}
 
 	tx, err := m.db.BeginTx(ctx, nil)
@@ -217,13 +256,31 @@ func (m *MySQL) CommitStep(ctx context.Context, snap graph.Snapshot, artifacts [
 
 	var latestID sql.NullString
 	var latestRev int64
-	err = tx.QueryRowContext(ctx, `
-		SELECT latest_checkpoint_id, latest_revision
-		FROM graph_threads WHERE thread_id = ? FOR UPDATE
-	`, snap.ThreadID).Scan(&latestID, &latestRev)
+	var leaseOK int
+	if grant != nil {
+		err = tx.QueryRowContext(ctx, `
+			SELECT latest_checkpoint_id, latest_revision,
+			       CASE
+			         WHEN lease_run_id = ? AND lease_epoch = ?
+			              AND lease_expires_at IS NOT NULL
+			              AND lease_expires_at > UTC_TIMESTAMP(6)
+			         THEN 1 ELSE 0
+			       END
+			FROM graph_threads WHERE thread_id = ? FOR UPDATE
+		`, grant.RunID, grant.Epoch, snap.ThreadID).Scan(&latestID, &latestRev, &leaseOK)
+	} else {
+		err = tx.QueryRowContext(ctx, `
+			SELECT latest_checkpoint_id, latest_revision
+			FROM graph_threads WHERE thread_id = ? FOR UPDATE
+		`, snap.ThreadID).Scan(&latestID, &latestRev)
+	}
 	if err != nil {
 		return fmt.Errorf("checkpoint: lock thread: %w", err)
 	}
+	if grant != nil && leaseOK != 1 {
+		return graph.ErrLeaseLost
+	}
+
 	curLatest := ""
 	if latestID.Valid {
 		curLatest = latestID.String

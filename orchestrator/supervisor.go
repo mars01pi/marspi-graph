@@ -73,6 +73,10 @@ type SupervisorConfig struct {
 	// Durable is the P1 MySQL/Memory history store. When set, preferred over Checkpointer
 	// and agentspec workers use PersistSession.
 	Durable graph.DurableCheckpointer
+	// Lease enables exclusive Invoke/Resume for ThreadID (requires fenced Durable).
+	Lease graph.ExecutionLease
+	// LeaseTTL overrides the default lease lifetime when Lease is set.
+	LeaseTTL time.Duration
 	// EventHandler receives graph lifecycle events for this run.
 	EventHandler graph.EventHandler
 	// ResumeFromCheckpoint skips Invoke and continues from the latest snapshot
@@ -487,11 +491,27 @@ func supervisorStore(cfg SupervisorConfig) (
 ) {
 	if cfg.Durable != nil {
 		d := cfg.Durable
-		return []graph.CompileOption{graph.WithDurableCheckpointer(d)}, d.GetLatest, nil
+		opts := []graph.CompileOption{graph.WithDurableCheckpointer(d)}
+		opts = append(opts, leaseCompileOpts(cfg.Lease, cfg.LeaseTTL)...)
+		return opts, d.GetLatest, nil
+	}
+	if cfg.Lease != nil {
+		return nil, nil, fmt.Errorf("orchestrator: Lease requires Durable checkpointer with fenced commit")
 	}
 	cp := cfg.Checkpointer
 	if cp == nil {
 		cp = checkpoint.NewMemory()
 	}
 	return []graph.CompileOption{graph.WithCheckpointer(cp)}, cp.Get, nil
+}
+
+func leaseCompileOpts(lease graph.ExecutionLease, ttl time.Duration) []graph.CompileOption {
+	if lease == nil {
+		return nil
+	}
+	opts := []graph.CompileOption{graph.WithExecutionLease(lease)}
+	if ttl > 0 {
+		opts = append(opts, graph.WithLeaseTTL(ttl))
+	}
+	return opts
 }

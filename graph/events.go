@@ -20,6 +20,9 @@ const (
 	EventCheckpointError  EventType = "checkpoint_error"
 	EventInterrupt        EventType = "interrupt"
 	EventRunEnd           EventType = "run_end"
+	EventLeaseAcquired    EventType = "lease_acquired"
+	EventLeaseRenewFailed EventType = "lease_renew_failed"
+	EventLeaseReleased    EventType = "lease_released"
 	EventCustom           EventType = "custom"
 )
 
