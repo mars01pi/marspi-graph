@@ -4,23 +4,39 @@
 
 | Status | Item | Notes |
 |--------|------|-------|
-| done | Graph-only Resume docs (ADR 0004) | Honest checkpoint semantics |
+| done | Graph-only Resume docs (ADR 0004) | Amended for P1 durable boundary |
 | done | LoopCtx error + agentspec unify | Error propagation |
 | done | Orchestrator → agentspec; ThreadID; changedFiles | No dual agent builders |
 | done | Interrupt/Resume guards + tests | Engine edge cases |
 | done | CLI cancel ctx + unique ThreadID | Esc stops /loopg /supervise |
 | done | CLI HITL on Supervisor coder handoff | `RequireApprovalFor` + `OnInterrupt` + Confirm |
 | done | Supervisor reliable routing (handoff tool-call) | `handoff(to,reason,task)` enum; no prose JSON |
-| done | SQLite checkpointer (latest-per-thread) | `checkpoint.OpenSQLite`; inject via SupervisorConfig |
-| later | AgentStore (persist agentctx per node) | Needed for true HITL chat resume |
+| done | SQLite checkpointer (latest-per-thread) | **Legacy only** — not P1 production backend |
 
-## Deferred product work
+## P1 Durable Runtime (MySQL)
+
+Design: [`docs/design/p1-durable-runtime.md`](./design/p1-durable-runtime.md)  
+ADRs: 0005 AgentStore, 0006 Checkpoint history, 0007 Graph events
+
+| Status | Item | Notes |
+|--------|------|-------|
+| done | Design docs + ADR 0005–0007 | Phase 0 |
+| done | MySQL history + Memory DurableCheckpointer | CommitStep, CAS, prune |
+| done | Graph lifecycle events | ADR 0007; sync handler + panic recover |
+| done | Checkpoint-scoped AgentStore + step artifacts | PersistSession |
+| done | Supervisor / CodingLoop durable alignment | Durable + ResumeFromCheckpoint |
+
+**SQLite:** remains latest-only for CLI/single-process. No history / AgentStore extension. No SQLite→MySQL auto-migrate in P1.
+
+**MySQL integration tests:** set `MARSPI_MYSQL_DSN` to enable.
+
+## Deferred product work (P1.5+)
 
 | Priority | Item | Notes |
 |----------|------|-------|
+| — | Distributed execution lease | Beyond parent CAS |
+| — | HTTP idempotent run API / SSE | Service surface |
+| — | Async event transport | Sync handler only in P1 |
+| — | Time-travel Resume API | History queryable in P1 |
 | — | Parallel / Send fan-out | Needs reducer-safe executor (ADR 0002) |
-| — | Checkpoint history / time-travel | SQLite currently latest-only (Memory-compatible) |
 | — | Per-worker `transfer_to_*` tools | Equivalent to single `handoff(to=…)` already shipped |
-| — | Tool-based `transfer_to_*` as alternate handoff UX | Related to reliable routing above |
-
-When picking up reliable routing: start with a single `handoff(to, reason, task)` tool on the supervisor node; do not stack business tools + structured output in one call.

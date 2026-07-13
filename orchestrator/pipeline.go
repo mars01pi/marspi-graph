@@ -9,7 +9,8 @@ import (
 
 // Pipeline builds a linear node1→node2→…→END graph.
 // order lists node names in execution order; nodes must contain each name.
-func Pipeline(nodes map[string]graph.NodeFunc, order []string) (*graph.Compiled, error) {
+// Pass graph.WithCheckpointer / WithDurableCheckpointer to enable Interrupt/Resume.
+func Pipeline(nodes map[string]graph.NodeFunc, order []string, opts ...graph.CompileOption) (*graph.Compiled, error) {
 	if len(order) == 0 {
 		return nil, fmt.Errorf("orchestrator: empty pipeline order")
 	}
@@ -26,5 +27,5 @@ func Pipeline(nodes map[string]graph.NodeFunc, order []string) (*graph.Compiled,
 		b.AddEdge(order[i], order[i+1])
 	}
 	b.AddEdge(order[len(order)-1], graph.END)
-	return b.Compile()
+	return b.Compile(opts...)
 }

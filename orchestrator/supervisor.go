@@ -47,7 +47,8 @@ type InterruptInfo struct {
 type OnInterruptFunc func(ctx context.Context, info InterruptInfo) (approve bool, err error)
 
 // SupervisorConfig configures a star-topology supervisor workflow.
-// Invoke-oriented: graph Resume does not restore worker agentctx (ADR 0004).
+// Without Durable, Resume is graph-only (ADR 0004). With Durable + PersistSession
+// workers, agent chat is restored at the checkpoint boundary (ADR 0005).
 type SupervisorConfig struct {
 	Goal         string
 	Workers      []WorkerSpec
@@ -67,10 +68,15 @@ type SupervisorConfig struct {
 	// OnInterrupt handles graph interrupts. If nil and a gated worker interrupts,
 	// RunSupervisor returns the interrupt error to the caller.
 	OnInterrupt OnInterruptFunc
-	// Checkpointer persists graph snapshots. nil → in-memory (single process).
+	// Checkpointer persists graph snapshots (legacy latest-only). nil → in-memory.
 	Checkpointer graph.Checkpointer
+	// Durable is the P1 MySQL/Memory history store. When set, preferred over Checkpointer
+	// and agentspec workers use PersistSession.
+	Durable graph.DurableCheckpointer
+	// EventHandler receives graph lifecycle events for this run.
+	EventHandler graph.EventHandler
 	// ResumeFromCheckpoint skips Invoke and continues from the latest snapshot
-	// for ThreadID (requires a durable Checkpointer).
+	// for ThreadID (requires Checkpointer or Durable).
 	ResumeFromCheckpoint bool
 }
 
@@ -156,6 +162,14 @@ func RunSupervisor(ctx context.Context, cfg SupervisorConfig) (SupervisorResult,
 			Task:   task,
 		}
 		summary := fmt.Sprintf("[supervisor → %s] %s", next, decision.Reason)
+		graph.EmitCustom(runCtx, graph.Event{
+			Metadata: map[string]string{
+				"kind":   "handoff",
+				"from":   supervisorNode,
+				"to":     next,
+				"reason": decision.Reason,
+			},
+		})
 		return graph.Update{
 			"next":       next,
 			"handoff":    handoffToMap(h),
@@ -207,7 +221,7 @@ func RunSupervisor(ctx context.Context, cfg SupervisorConfig) (SupervisorResult,
 				if sys == "" {
 					sys = cfg.SystemPrompt
 				}
-				inst := agentspec.New(agentspec.Spec{
+				spec := agentspec.Spec{
 					ID:           w.ID,
 					SystemPrompt: sys,
 					Provider:     cfg.Provider,
@@ -218,7 +232,12 @@ func RunSupervisor(ctx context.Context, cfg SupervisorConfig) (SupervisorResult,
 					Stream:       cfg.Stream,
 					Reporter:     cfg.Reporter,
 					Events:       cfg.Events,
-				})
+				}
+				if cfg.Durable != nil {
+					spec.Persist = agentspec.PersistSession
+					spec.Store = cfg.Durable
+				}
+				inst := agentspec.New(spec)
 				text, err := inst.RunOnce(runCtx, formatWorkerPrompt(w, s.GetString("goal"), task, s))
 				if err != nil {
 					return nil, fmt.Errorf("worker %q: %w", w.ID, err)
@@ -244,11 +263,11 @@ func RunSupervisor(ctx context.Context, cfg SupervisorConfig) (SupervisorResult,
 		return next
 	})
 
-	cp := cfg.Checkpointer
-	if cp == nil {
-		cp = checkpoint.NewMemory()
+	compileOpts, loadLatest, err := supervisorStore(cfg)
+	if err != nil {
+		return SupervisorResult{}, err
 	}
-	g, err := b.Compile(graph.WithCheckpointer(cp))
+	g, err := b.Compile(compileOpts...)
 	if err != nil {
 		return SupervisorResult{}, err
 	}
@@ -257,13 +276,16 @@ func RunSupervisor(ctx context.Context, cfg SupervisorConfig) (SupervisorResult,
 		graph.WithThreadID(cfg.ThreadID),
 		graph.WithMaxSteps(cfg.MaxSteps*2 + 2),
 	}
+	if cfg.EventHandler != nil {
+		runOpts = append(runOpts, graph.WithEventHandler(cfg.EventHandler))
+	}
 
 	var out graph.State
 	if cfg.ResumeFromCheckpoint {
-		if cfg.Checkpointer == nil {
-			return SupervisorResult{}, fmt.Errorf("orchestrator: ResumeFromCheckpoint requires Checkpointer")
+		if cfg.Checkpointer == nil && cfg.Durable == nil {
+			return SupervisorResult{}, fmt.Errorf("orchestrator: ResumeFromCheckpoint requires Checkpointer or Durable")
 		}
-		snap, ok, gerr := cp.Get(ctx, cfg.ThreadID)
+		snap, ok, gerr := loadLatest(ctx, cfg.ThreadID)
 		if gerr != nil {
 			return SupervisorResult{}, gerr
 		}
@@ -456,4 +478,20 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n] + "…"
+}
+
+func supervisorStore(cfg SupervisorConfig) (
+	opts []graph.CompileOption,
+	loadLatest func(context.Context, string) (graph.Snapshot, bool, error),
+	err error,
+) {
+	if cfg.Durable != nil {
+		d := cfg.Durable
+		return []graph.CompileOption{graph.WithDurableCheckpointer(d)}, d.GetLatest, nil
+	}
+	cp := cfg.Checkpointer
+	if cp == nil {
+		cp = checkpoint.NewMemory()
+	}
+	return []graph.CompileOption{graph.WithCheckpointer(cp)}, cp.Get, nil
 }

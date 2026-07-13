@@ -143,6 +143,45 @@ func TestSQLiteDeleteAndListInterrupted(t *testing.T) {
 	}
 }
 
+func TestSQLiteListResumableIncludesCancelMidRun(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cp.db")
+	s, err := checkpoint.OpenSQLite(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+
+	// Esc mid-run: last Put is interrupt=0, next node still pending.
+	_ = s.Put(ctx, "cancelled", graph.Snapshot{
+		Node: "researcher", Step: 1, Interrupt: false,
+		State: graph.State{"goal": "x"},
+	})
+	_ = s.Put(ctx, "done", graph.Snapshot{
+		Node: graph.END, Step: 3, Interrupt: false,
+		State: graph.State{"goal": "y"},
+	})
+	_ = s.Put(ctx, "hitl", graph.Snapshot{
+		Node: "coder", Step: 2, Interrupt: true,
+		State: graph.State{"goal": "z"},
+	})
+
+	list, err := s.ListResumable(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 2 {
+		t.Fatalf("want 2 resumable, got %+v", list)
+	}
+	ids := map[string]bool{}
+	for _, m := range list {
+		ids[m.ThreadID] = true
+	}
+	if !ids["cancelled"] || !ids["hitl"] || ids["done"] {
+		t.Fatalf("%+v", list)
+	}
+}
+
 func TestSQLiteEmptyPath(t *testing.T) {
 	_, err := checkpoint.OpenSQLite("")
 	if err == nil {

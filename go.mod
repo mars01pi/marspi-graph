@@ -2,9 +2,14 @@ module github.com/mars/marspi-graph
 
 go 1.25.0
 
-require github.com/mars/marspi-core v0.0.0
+require (
+	github.com/go-sql-driver/mysql v1.9.3
+	github.com/mars/marspi-core v0.0.0
+	modernc.org/sqlite v1.53.0
+)
 
 require (
+	filippo.io/edwards25519 v1.1.0 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
@@ -14,7 +19,6 @@ require (
 	modernc.org/libc v1.73.4 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
-	modernc.org/sqlite v1.53.0 // indirect
 )
 
 replace github.com/mars/marspi-core => ../marspi-core

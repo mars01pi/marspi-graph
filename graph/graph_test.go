@@ -121,7 +121,7 @@ func TestInterruptAndResume(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err = g.Invoke(context.Background(), graph.State{}, graph.WithThreadID("hitl"))
+	_, err = g.Invoke(context.Background(), graph.State{}, graph.WithThreadID("hitl-001"))
 	if !graph.IsInterrupted(err) {
 		t.Fatalf("want interrupt, got %v", err)
 	}
@@ -130,7 +130,7 @@ func TestInterruptAndResume(t *testing.T) {
 		t.Fatalf("interrupt=%#v ok=%v", ie, ok)
 	}
 
-	out, err := g.Resume(context.Background(), "hitl", graph.WithCommand(graph.Command{
+	out, err := g.Resume(context.Background(), "hitl-001", graph.WithCommand(graph.Command{
 		Resume: "approve",
 	}))
 	if err != nil {

@@ -18,7 +18,8 @@ import (
 )
 
 // CodingLoopConfig configures the Implementer → Verifier → Updater workflow.
-// Invoke-oriented: graph Resume does not restore implementer agentctx (ADR 0004).
+// Without Durable, Resume is graph-only (ADR 0004). With Durable, implementer
+// uses PersistSession; verifier/updater stay ephemeral.
 type CodingLoopConfig struct {
 	Goal         string
 	MaxIter      int
@@ -31,8 +32,14 @@ type CodingLoopConfig struct {
 	MaxIterAgent int
 	Stream       bool
 	ThreadID     string // empty → coding-loop-<unixnano>
-	// Checkpointer persists graph snapshots. nil → in-memory.
+	// Checkpointer persists graph snapshots (legacy). nil → in-memory.
 	Checkpointer graph.Checkpointer
+	// Durable prefers history + implementer session persistence.
+	Durable graph.DurableCheckpointer
+	// EventHandler receives graph lifecycle events for this run.
+	EventHandler graph.EventHandler
+	// ResumeFromCheckpoint skips Invoke and continues from latest snapshot.
+	ResumeFromCheckpoint bool
 }
 
 // CodingLoopResult is the outcome of a coding loop run.
@@ -69,7 +76,7 @@ func RunCodingLoop(ctx context.Context, cfg CodingLoopConfig) (CodingLoopResult,
 		cfg.ThreadID = fmt.Sprintf("coding-loop-%d", time.Now().UnixNano())
 	}
 
-	impl := agentspec.New(agentspec.Spec{
+	implSpec := agentspec.Spec{
 		ID:           "implementer",
 		SystemPrompt: cfg.SystemPrompt,
 		Provider:     cfg.Provider,
@@ -79,7 +86,12 @@ func RunCodingLoop(ctx context.Context, cfg CodingLoopConfig) (CodingLoopResult,
 		Stream:       cfg.Stream,
 		Reporter:     cfg.Reporter,
 		Events:       cfg.Events,
-	})
+	}
+	if cfg.Durable != nil {
+		implSpec.Persist = agentspec.PersistSession
+		implSpec.Store = cfg.Durable
+	}
+	impl := agentspec.New(implSpec)
 
 	b := graph.NewBuilder()
 	b.AddNode("implementer", func(runCtx context.Context, s graph.State) (graph.Update, error) {
@@ -219,21 +231,43 @@ func RunCodingLoop(ctx context.Context, cfg CodingLoopConfig) (CodingLoopResult,
 	})
 	b.AddEdge("updater", "implementer")
 
-	cp := cfg.Checkpointer
-	if cp == nil {
-		cp = checkpoint.NewMemory()
+	compileOpts := []graph.CompileOption{}
+	if cfg.Durable != nil {
+		compileOpts = append(compileOpts, graph.WithDurableCheckpointer(cfg.Durable))
+	} else {
+		cp := cfg.Checkpointer
+		if cp == nil {
+			cp = checkpoint.NewMemory()
+		}
+		compileOpts = append(compileOpts, graph.WithCheckpointer(cp))
 	}
-	g, err := b.Compile(graph.WithCheckpointer(cp))
+	g, err := b.Compile(compileOpts...)
 	if err != nil {
 		return CodingLoopResult{}, err
 	}
 
-	out, err := g.Invoke(ctx, graph.State{
-		"goal":      cfg.Goal,
-		"max_iter":  cfg.MaxIter,
-		"iteration": 1,
-		"status":    "running",
-	}, graph.WithThreadID(cfg.ThreadID), graph.WithMaxSteps(cfg.MaxIter*4+2))
+	runOpts := []graph.RunOption{
+		graph.WithThreadID(cfg.ThreadID),
+		graph.WithMaxSteps(cfg.MaxIter*4 + 2),
+	}
+	if cfg.EventHandler != nil {
+		runOpts = append(runOpts, graph.WithEventHandler(cfg.EventHandler))
+	}
+
+	var out graph.State
+	if cfg.ResumeFromCheckpoint {
+		if cfg.Checkpointer == nil && cfg.Durable == nil {
+			return CodingLoopResult{}, fmt.Errorf("orchestrator: ResumeFromCheckpoint requires Checkpointer or Durable")
+		}
+		out, err = g.Resume(ctx, cfg.ThreadID, runOpts...)
+	} else {
+		out, err = g.Invoke(ctx, graph.State{
+			"goal":      cfg.Goal,
+			"max_iter":  cfg.MaxIter,
+			"iteration": 1,
+			"status":    "running",
+		}, runOpts...)
+	}
 	if err != nil {
 		return CodingLoopResult{}, err
 	}

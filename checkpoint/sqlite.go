@@ -178,13 +178,23 @@ func (s *SQLite) Delete(ctx context.Context, threadID string) error {
 
 // ListInterrupted returns threads currently paused on an interrupt.
 func (s *SQLite) ListInterrupted(ctx context.Context) ([]SnapshotMeta, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	return s.list(ctx, `interrupt = 1`)
+}
+
+// ListResumable returns threads that can continue: HITL interrupt, or
+// cancelled mid-run (last Put with interrupt=0 and node != END).
+func (s *SQLite) ListResumable(ctx context.Context) ([]SnapshotMeta, error) {
+	return s.list(ctx, `interrupt = 1 OR node != ?`, graph.END)
+}
+
+func (s *SQLite) list(ctx context.Context, where string, args ...any) ([]SnapshotMeta, error) {
+	q := `
 		SELECT thread_id, node, step, interrupt, updated_at
-		FROM checkpoints WHERE interrupt = 1
-		ORDER BY updated_at DESC
-	`)
+		FROM checkpoints WHERE ` + where + `
+		ORDER BY updated_at DESC`
+	rows, err := s.db.QueryContext(ctx, q, args...)
 	if err != nil {
-		return nil, fmt.Errorf("checkpoint: list interrupted: %w", err)
+		return nil, fmt.Errorf("checkpoint: list: %w", err)
 	}
 	defer rows.Close()
 

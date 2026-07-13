@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 )
 
 // Builder constructs a StateGraph before Compile.
@@ -148,22 +149,30 @@ func (b *Builder) Compile(opts ...CompileOption) (*Compiled, error) {
 		reducers:     reducers,
 		entry:        b.entry,
 		checkpointer: cfg.checkpointer,
+		durable:      cfg.durable,
 	}, nil
 }
 
 type compileConfig struct {
 	checkpointer Checkpointer
+	durable      DurableCheckpointer
 }
 
 // CompileOption configures Compile.
 type CompileOption func(*compileConfig)
 
-// WithCheckpointer attaches a checkpointer used by Invoke/Resume.
+// WithCheckpointer attaches a legacy checkpointer used by Invoke/Resume.
 func WithCheckpointer(cp Checkpointer) CompileOption {
 	return func(c *compileConfig) { c.checkpointer = cp }
 }
 
-// Checkpointer persists graph snapshots between super-steps.
+// WithDurableCheckpointer attaches the P1 durable store (MySQL / Memory).
+// When set, CommitStep/GetLatest are preferred over legacy Put/Get.
+func WithDurableCheckpointer(d DurableCheckpointer) CompileOption {
+	return func(c *compileConfig) { c.durable = d }
+}
+
+// Checkpointer persists graph snapshots between super-steps (latest-only).
 type Checkpointer interface {
 	Put(ctx context.Context, threadID string, snap Snapshot) error
 	Get(ctx context.Context, threadID string) (Snapshot, bool, error)
@@ -171,12 +180,16 @@ type Checkpointer interface {
 
 // Snapshot is one checkpoint of graph execution.
 type Snapshot struct {
-	ThreadID       string
-	Node           string // next node to run (or current if Interrupt)
-	State          State
-	Step           int
-	Interrupt      bool
-	InterruptValue any
+	CheckpointID       string
+	ParentCheckpointID string
+	Revision           int64
+	CreatedAt          time.Time
+	ThreadID           string
+	Node               string // next node to run (or current if Interrupt)
+	State              State
+	Step               int
+	Interrupt          bool
+	InterruptValue     any
 }
 
 // Compiled is an immutable runnable graph.
@@ -186,36 +199,35 @@ type Compiled struct {
 	routes       map[string]RouteFunc
 	reducers     map[string]Reducer
 	entry        string
-	checkpointer  Checkpointer
+	checkpointer Checkpointer
+	durable      DurableCheckpointer
 }
 
 // Invoke runs the graph to completion (or interrupt) starting from entry.
 func (g *Compiled) Invoke(ctx context.Context, in State, opts ...RunOption) (State, error) {
-	cfg := runConfig{threadID: "default"}
-	for _, o := range opts {
-		o(&cfg)
-	}
+	cfg := g.prepareRun(opts...)
 	state := in.Clone()
 	if state == nil {
 		state = State{}
 	}
-	return g.run(ctx, state, g.entry, 0, cfg)
+	ctx = g.enrichCtx(ctx, cfg, "")
+	g.emit(ctx, cfg, Event{Type: EventRunStart, Step: 0})
+	out, err := g.run(ctx, state, g.entry, 0, "", cfg)
+	g.emitRunEnd(ctx, cfg, err)
+	return out, err
 }
 
 // Resume continues from the latest checkpoint for threadID.
 // Pass WithCommand to inject a resume value / state patch after interrupt.
 func (g *Compiled) Resume(ctx context.Context, threadID string, opts ...RunOption) (State, error) {
-	cfg := runConfig{threadID: "default"}
-	for _, o := range opts {
-		o(&cfg)
-	}
+	cfg := g.prepareRun(opts...)
 	if threadID != "" {
 		cfg.threadID = threadID
 	}
-	if g.checkpointer == nil {
+	if g.durable == nil && g.checkpointer == nil {
 		return nil, fmt.Errorf("graph: resume requires a checkpointer")
 	}
-	snap, ok, err := g.checkpointer.Get(ctx, cfg.threadID)
+	snap, ok, err := g.loadLatest(ctx, cfg.threadID)
 	if err != nil {
 		return nil, err
 	}
@@ -236,6 +248,9 @@ func (g *Compiled) Resume(ctx context.Context, threadID string, opts ...RunOptio
 		node = cfg.command.Goto
 	}
 	if node == "" || node == END {
+		ctx = g.enrichCtx(ctx, cfg, snap.CheckpointID)
+		g.emit(ctx, cfg, Event{Type: EventRunResume, CheckpointID: snap.CheckpointID, Step: snap.Step})
+		g.emit(ctx, cfg, Event{Type: EventRunEnd, CheckpointID: snap.CheckpointID, Step: snap.Step, Metadata: map[string]string{"status": "completed"}})
 		return state, nil
 	}
 
@@ -246,10 +261,73 @@ func (g *Compiled) Resume(ctx context.Context, threadID string, opts ...RunOptio
 		ctx = WithResumeValue(ctx, cfg.command.Resume)
 	}
 
-	return g.run(ctx, state, node, snap.Step, cfg)
+	parentID := snap.CheckpointID
+	ctx = g.enrichCtx(ctx, cfg, parentID)
+	g.emit(ctx, cfg, Event{Type: EventRunResume, CheckpointID: parentID, NodeID: node, Step: snap.Step})
+	out, err := g.run(ctx, state, node, snap.Step, parentID, cfg)
+	g.emitRunEnd(ctx, cfg, err)
+	return out, err
 }
 
-func (g *Compiled) run(ctx context.Context, state State, node string, step int, cfg runConfig) (State, error) {
+func (g *Compiled) prepareRun(opts ...RunOption) runConfig {
+	cfg := runConfig{threadID: "default", runID: NewID()}
+	for _, o := range opts {
+		o(&cfg)
+	}
+	if cfg.runID == "" {
+		cfg.runID = NewID()
+	}
+	return cfg
+}
+
+func (g *Compiled) enrichCtx(ctx context.Context, cfg runConfig, parentCheckpointID string) context.Context {
+	ctx = WithThreadIDCtx(ctx, cfg.threadID)
+	ctx = WithRunID(ctx, cfg.runID)
+	ctx = WithParentCheckpointID(ctx, parentCheckpointID)
+	if cfg.events != nil {
+		ctx = withEventHandler(ctx, cfg.events)
+	}
+	return ctx
+}
+
+func (g *Compiled) emitRunEnd(ctx context.Context, cfg runConfig, err error) {
+	meta := map[string]string{"status": "completed"}
+	if err != nil {
+		if IsInterrupted(err) {
+			meta["status"] = "paused"
+		} else if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			meta["status"] = "cancelled"
+		} else {
+			meta["status"] = "error"
+			meta["error"] = FormatEventErr(err)
+		}
+	}
+	g.emit(ctx, cfg, Event{Type: EventRunEnd, Err: err, Metadata: meta})
+}
+
+func (g *Compiled) loadLatest(ctx context.Context, threadID string) (Snapshot, bool, error) {
+	if g.durable != nil {
+		return g.durable.GetLatest(ctx, threadID)
+	}
+	return g.checkpointer.Get(ctx, threadID)
+}
+
+func (g *Compiled) persist(ctx context.Context, cfg runConfig, snap Snapshot, artifacts []StepArtifact) error {
+	if g.durable != nil {
+		return g.durable.CommitStep(ctx, snap, artifacts)
+	}
+	if g.checkpointer != nil {
+		return g.checkpointer.Put(ctx, cfg.threadID, snap)
+	}
+	return fmt.Errorf("graph: no checkpointer")
+}
+
+func (g *Compiled) hasStore() bool {
+	return g.durable != nil || g.checkpointer != nil
+}
+
+func (g *Compiled) run(ctx context.Context, state State, node string, step int, parentCheckpointID string, cfg runConfig) (State, error) {
+	parent := parentCheckpointID
 	for node != "" && node != END {
 		if err := ctx.Err(); err != nil {
 			return state, err
@@ -259,27 +337,46 @@ func (g *Compiled) run(ctx context.Context, state State, node string, step int, 
 			return state, fmt.Errorf("graph: unknown node %q", node)
 		}
 
-		upd, err := fn(ctx, state)
+		nodeCtx := WithNodeID(ctx, node)
+		nodeCtx = WithParentCheckpointID(nodeCtx, parent)
+		nodeCtx, collector := WithStepArtifacts(nodeCtx)
+
+		g.emit(nodeCtx, cfg, Event{Type: EventNodeStart, NodeID: node, Step: step, CheckpointID: parent})
+
+		upd, err := fn(nodeCtx, state)
 		if ie, ok := AsInterrupt(err); ok {
 			ie.Node = node
-			if g.checkpointer == nil {
+			if !g.hasStore() {
+				g.emit(nodeCtx, cfg, Event{Type: EventNodeError, NodeID: node, Step: step, Err: ie})
 				return state, fmt.Errorf("graph: interrupt at %q requires a checkpointer: %w", node, ie)
 			}
-			if putErr := g.checkpointer.Put(ctx, cfg.threadID, Snapshot{
-				ThreadID:       cfg.threadID,
-				Node:           node, // re-enter same node on Resume
-				State:          state.Clone(),
-				Step:           step,
-				Interrupt:      true,
-				InterruptValue: ie.Value,
-			}); putErr != nil {
+			snap := Snapshot{
+				CheckpointID:       NewID(),
+				ParentCheckpointID: parent,
+				ThreadID:           cfg.threadID,
+				Node:               node, // re-enter same node on Resume
+				State:              state.Clone(),
+				Step:               step,
+				Interrupt:          true,
+				InterruptValue:     ie.Value,
+				CreatedAt:          time.Now().UTC(),
+			}
+			arts := collector.snapshot()
+			if putErr := g.persist(nodeCtx, cfg, snap, arts); putErr != nil {
+				g.emit(nodeCtx, cfg, Event{Type: EventCheckpointError, NodeID: node, Step: step, CheckpointID: snap.CheckpointID, Err: putErr})
 				return state, putErr
 			}
+			parent = snap.CheckpointID
+			g.emit(nodeCtx, cfg, Event{Type: EventCheckpoint, NodeID: node, Step: step, CheckpointID: snap.CheckpointID, Metadata: map[string]string{"interrupt": "true"}})
+			g.emit(nodeCtx, cfg, Event{Type: EventInterrupt, NodeID: node, Step: step, CheckpointID: snap.CheckpointID})
 			return state, ie
 		}
 		if err != nil {
+			g.emit(nodeCtx, cfg, Event{Type: EventNodeError, NodeID: node, Step: step, Err: err})
 			return state, fmt.Errorf("graph: node %q: %w", node, err)
 		}
+
+		g.emit(nodeCtx, cfg, Event{Type: EventNodeEnd, NodeID: node, Step: step, CheckpointID: parent})
 
 		state = Apply(state, upd, g.reducers)
 		step++
@@ -291,16 +388,33 @@ func (g *Compiled) run(ctx context.Context, state State, node string, step int, 
 		if err != nil {
 			return state, err
 		}
-		if g.checkpointer != nil {
-			if err := g.checkpointer.Put(ctx, cfg.threadID, Snapshot{
-				ThreadID:  cfg.threadID,
-				Node:      next,
-				State:     state.Clone(),
-				Step:      step,
-				Interrupt: false,
-			}); err != nil {
+		g.emit(nodeCtx, cfg, Event{
+			Type:         EventRoute,
+			NodeID:       node,
+			Step:         step,
+			CheckpointID: parent,
+			Metadata:     map[string]string{"from": node, "to": next},
+		})
+
+		if g.hasStore() {
+			snap := Snapshot{
+				CheckpointID:       NewID(),
+				ParentCheckpointID: parent,
+				ThreadID:           cfg.threadID,
+				Node:               next,
+				State:              state.Clone(),
+				Step:               step,
+				Interrupt:          false,
+				CreatedAt:          time.Now().UTC(),
+			}
+			arts := collector.snapshot()
+			if err := g.persist(nodeCtx, cfg, snap, arts); err != nil {
+				g.emit(nodeCtx, cfg, Event{Type: EventCheckpointError, NodeID: node, Step: step, CheckpointID: snap.CheckpointID, Err: err})
 				return state, err
 			}
+			parent = snap.CheckpointID
+			ctx = WithParentCheckpointID(ctx, parent)
+			g.emit(nodeCtx, cfg, Event{Type: EventCheckpoint, NodeID: node, Step: step, CheckpointID: snap.CheckpointID, Metadata: map[string]string{"next": next}})
 		}
 		node = next
 		if cfg.maxSteps > 0 && step >= cfg.maxSteps {
@@ -334,6 +448,8 @@ type runConfig struct {
 	threadID string
 	maxSteps int
 	command  *Command
+	runID    string
+	events   EventHandler
 }
 
 // RunOption configures a single Invoke/Resume.
@@ -358,6 +474,11 @@ func WithCommand(cmd Command) RunOption {
 	return func(c *runConfig) {
 		c.command = &cmd
 	}
+}
+
+// WithEventHandler attaches a per-run lifecycle event handler.
+func WithEventHandler(h EventHandler) RunOption {
+	return func(c *runConfig) { c.events = h }
 }
 
 // IsInterrupted reports whether err is (or wraps) an interrupt.
