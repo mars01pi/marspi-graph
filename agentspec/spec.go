@@ -99,6 +99,9 @@ func New(spec Spec) *Instance {
 		MaxContext: spec.MaxContext,
 		MaxIter:    spec.MaxIter,
 		Stream:     spec.Stream,
+		ToolMeta: func(ctx context.Context, toolName, toolCallID string) tool.ExecutionMeta {
+			return toolMetaFromGraph(ctx, toolName, toolCallID)
+		},
 	}
 	schemas := []map[string]any(nil)
 	if reg != nil {
@@ -229,4 +232,33 @@ func lastCompletion(m *agentctx.Manager) string {
 		}
 	}
 	return ""
+}
+
+// toolMetaFromGraph maps graph context into core ExecutionMeta for tool calls.
+// OperationID defaults to toolCallID (stable within one LLM turn).
+func toolMetaFromGraph(ctx context.Context, toolName, toolCallID string) tool.ExecutionMeta {
+	op := toolCallID
+	if op == "" {
+		op = toolName
+	}
+	exec, err := graph.ToolExecutionFrom(ctx, toolName, op)
+	if err != nil {
+		return tool.ExecutionMeta{
+			ThreadID:           graph.ThreadID(ctx),
+			RunID:              graph.RunID(ctx),
+			NodeID:             graph.NodeID(ctx),
+			ParentCheckpointID: graph.ParentCheckpointID(ctx),
+			LeaseEpoch:         graph.LeaseEpoch(ctx),
+			ToolCallID:         toolCallID,
+		}
+	}
+	return tool.ExecutionMeta{
+		ThreadID:           exec.ThreadID,
+		RunID:              exec.RunID,
+		NodeID:             exec.NodeID,
+		ParentCheckpointID: exec.ParentCheckpointID,
+		LeaseEpoch:         exec.LeaseEpoch,
+		ToolCallID:         toolCallID,
+		IdempotencyKey:     exec.IdempotencyKey(),
+	}
 }

@@ -349,7 +349,48 @@ Do not emit secret connection or full state data.
 - Sequential reuse of an existing thread with a new Invoke is a separate
   idempotency/thread-lifecycle concern.
 - Force release/steal is an operations API, not part of the core interface.
-- Redis backend, HTTP idempotency, and tool-level fencing are later work.
+- Redis ExecutionLease backend remains later work.
+
+## Phase 4: Tool idempotency / fencing
+
+Phase 4 closes the gap between checkpoint fencing and external tool effects.
+
+### Delivered
+
+1. **`graph.ToolExecution`** — builds a stable `IdempotencyKey` and `FenceToken`
+   (lease epoch) from graph context. RunID and epoch are **excluded** from the
+   key so retry/takeover of the same logical operation reuses downstream dedup.
+2. **`marspi-core` ContextualTool bridge** — `ExecuteQuietCtx` + optional
+   `RunCtx(ctx, meta, args)`. Legacy `Run(args)` tools still work.
+3. **agentspec wiring** — `Runner.ToolMeta` fills `ExecutionMeta` from graph
+   context; default operation ID is the LLM `tool_call_id`.
+4. **bash / MCP** honor parent context cancellation instead of
+   `context.Background()`.
+
+### Tool author categories
+
+| Category | Guidance |
+|----------|----------|
+| Read-only | Rely on ctx cancellation + lease; no key required |
+| Idempotent write | Pass `IdempotencyKey` to downstream (HTTP header, unique index) |
+| Fence-sensitive | Also pass `FenceToken` / lease epoch; refuse stale epochs |
+
+### Example (custom NodeFunc or ContextualTool)
+
+```go
+exec, err := graph.ToolExecutionFrom(ctx, "charge_card", orderID)
+if err != nil { return nil, err }
+req.Header.Set("Idempotency-Key", exec.IdempotencyKey())
+req.Header.Set("X-Marspi-Lease-Epoch", strconv.FormatInt(exec.FenceToken(), 10))
+```
+
+### Still out of scope
+
+- Durable tool-effect journal / result replay
+- Automatic exactly-once for tools that ignore meta
+- Redis lease backend
+
+See ADR 0009.
 
 ## Implementation phases
 
@@ -359,7 +400,7 @@ Do not emit secret connection or full state data.
 | 1 | `LeaseGrant`, `ExecutionLease`, heartbeat wrapper, Memory lease |
 | 2 | MySQL migration v2, lease ops, `CommitStepFenced` |
 | 3 | Supervisor/CodingLoop wiring and lease events |
-| 4 | Tool idempotency/fencing guidance and optional Redis backend |
+| 4 | ToolExecution helpers + core ContextualTool bridge (Redis optional later) |
 
 ## Success criteria for implementation
 
@@ -373,3 +414,5 @@ Do not emit secret connection or full state data.
 - Release remains bounded after caller context cancellation.
 - `lease == nil` preserves existing behavior.
 - Default tests do not require MySQL; MySQL concurrency tests are opt-in.
+- ToolExecution keys are stable across runID/epoch; Contextual tools receive
+  cancellation and ExecutionMeta via agentspec.

@@ -78,6 +78,8 @@ out, _ := g.Invoke(ctx, graph.State{"goal": "hello"})
 | `checkpoint.OpenSQLite(path)` | **Legacy** latest-only 文件持久化（CLI） |
 | `checkpoint.OpenMySQL(dsn)` / `NewDurableMemory()` | **P1** append history + AgentStore（ADR 0005/0006） |
 | `WithEventHandler(h)` | Graph lifecycle events（ADR 0007） |
+| `WithExecutionLease(l)` | P1.5 执行租约（ADR 0008） |
+| `graph.ToolExecutionFrom` | 工具幂等键 + lease fence token（ADR 0009） |
 
 ```go
 // Legacy CLI
@@ -94,6 +96,16 @@ out, _ = g.Resume(ctx, id, graph.WithCommand(graph.Command{Resume: true}))
 With `Durable` + `agentspec.PersistSession`，跨进程 Resume 会恢复 agent 对话（super-step 边界）。详见 [`docs/design/p1-durable-runtime.md`](docs/design/p1-durable-runtime.md)。
 
 Supervisor / CodingLoop 可通过 `Checkpointer` 或 `Durable` 注入；`ResumeFromCheckpoint` 跳过 Invoke 直接续跑。
+
+Custom nodes / ContextualTools can pass stable downstream metadata:
+
+```go
+exec, _ := graph.ToolExecutionFrom(ctx, "charge_card", orderID)
+req.Header.Set("Idempotency-Key", exec.IdempotencyKey())
+req.Header.Set("X-Marspi-Lease-Epoch", strconv.FormatInt(exec.FenceToken(), 10))
+```
+
+agentspec 已把 graph context 注入 `Runner.ToolMeta`；bash/MCP 会遵守父 `ctx` 取消。详见 ADR 0009。
 
 ---
 
@@ -206,6 +218,8 @@ marspi-graph/
 | [0005](./docs/adr/0005-agent-store.md) | Checkpoint-scoped AgentStore |
 | [0006](./docs/adr/0006-checkpoint-history.md) | MySQL checkpoint history |
 | [0007](./docs/adr/0007-graph-events.md) | Graph lifecycle events |
+| [0008](./docs/adr/0008-execution-lease.md) | Execution lease with monotonic fencing |
+| [0009](./docs/adr/0009-tool-execution-metadata.md) | ToolExecution + ContextualTool bridge |
 
 ---
 

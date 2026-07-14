@@ -48,6 +48,10 @@ func LeaseGrantFrom(ctx context.Context) (LeaseGrant, bool) {
 }
 
 // LeaseEpoch returns the fencing epoch from context, or 0.
+//
+// Use as a downstream fencing token for external systems (see ToolExecution).
+// It prevents a stale lease owner from being trusted after takeover; it does
+// not by itself dedupe tool side effects — pair with IdempotencyKey for that.
 func LeaseEpoch(ctx context.Context) int64 {
 	g, ok := LeaseGrantFrom(ctx)
 	if !ok {

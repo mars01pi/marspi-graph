@@ -42,6 +42,7 @@ ADR: [0008](./adr/0008-execution-lease.md)
 | done | MySQL lease migration + fenced commit | `lease_run_id` / `lease_epoch` / `lease_expires_at` |
 | done | Supervisor / CodingLoop lease wiring | `Lease` + `LeaseTTL` on configs |
 | done | Concurrency / HITL / fence tests | Memory default; MySQL opt-in via `MARSPI_MYSQL_DSN` |
+| done | ToolExecution + core ContextualTool bridge | ADR 0009; bash/MCP honor ctx |
 
 ## Deferred product work (later)
 
@@ -53,3 +54,4 @@ ADR: [0008](./adr/0008-execution-lease.md)
 | — | Parallel / Send fan-out | Needs reducer-safe executor (ADR 0002) |
 | — | Per-worker `transfer_to_*` tools | Equivalent to single `handoff(to=…)` already shipped |
 | — | Redis ExecutionLease backend | Interface reserved in ADR 0008 |
+| — | Durable tool-effect journal / replay | Needs ToolExecution + store schema |
