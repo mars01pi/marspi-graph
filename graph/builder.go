@@ -288,6 +288,10 @@ func (g *Compiled) Resume(ctx context.Context, threadID string, opts ...RunOptio
 		if !ok {
 			return nil, fmt.Errorf("graph: no checkpoint for thread %q", cfg.threadID)
 		}
+		if cfg.expectedCheckpointID != "" && snap.CheckpointID != cfg.expectedCheckpointID {
+			return nil, fmt.Errorf("%w: want %q, latest %q",
+				ErrExpectedCheckpointMismatch, cfg.expectedCheckpointID, snap.CheckpointID)
+		}
 
 		state := snap.State.Clone()
 		if state == nil {
@@ -693,13 +697,14 @@ func (s *leaseSession) set(g LeaseGrant) {
 }
 
 type runConfig struct {
-	threadID  string
-	maxSteps  int
-	command   *Command
-	runID     string // 实例id
-	events    EventHandler
-	leaseTTL  time.Duration
-	leaseSess *leaseSession
+	threadID             string
+	maxSteps             int
+	command              *Command
+	runID                string // 实例id
+	events               EventHandler
+	leaseTTL             time.Duration
+	leaseSess            *leaseSession
+	expectedCheckpointID string
 }
 
 // RunOption configures a single Invoke/Resume.
@@ -737,6 +742,14 @@ func WithRunLeaseTTL(ttl time.Duration) RunOption {
 		if ttl > 0 {
 			c.leaseTTL = ttl
 		}
+	}
+}
+
+// WithExpectedCheckpointID requires Resume to load exactly this latest checkpoint.
+// Checked after lease acquisition to close stale-approval TOCTOU windows.
+func WithExpectedCheckpointID(checkpointID string) RunOption {
+	return func(c *runConfig) {
+		c.expectedCheckpointID = checkpointID
 	}
 }
 

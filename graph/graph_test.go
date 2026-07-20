@@ -2,6 +2,7 @@ package graph_test
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -141,6 +142,53 @@ func TestInterruptAndResume(t *testing.T) {
 	}
 	if out["ok"] != true {
 		t.Fatalf("ok=%v", out["ok"])
+	}
+}
+
+func TestExpectedCheckpointMismatch(t *testing.T) {
+	cp := checkpoint.NewMemory()
+	b := graph.NewBuilder()
+	b.AddNode("ask", func(ctx context.Context, s graph.State) (graph.Update, error) {
+		v, err := graph.InterruptOrResume(ctx, "need-approval")
+		if err != nil {
+			return nil, err
+		}
+		return graph.Update{"decision": v}, nil
+	})
+	b.AddNode("done", func(ctx context.Context, s graph.State) (graph.Update, error) {
+		return graph.Update{"ok": true}, nil
+	})
+	b.SetEntry("ask")
+	b.AddEdge("ask", "done")
+	b.AddEdge("done", graph.END)
+
+	g, err := b.Compile(graph.WithCheckpointer(cp))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = g.Invoke(context.Background(), graph.State{}, graph.WithThreadID("exp-cp"))
+	if !graph.IsInterrupted(err) {
+		t.Fatalf("want interrupt, got %v", err)
+	}
+	snap, ok, err := cp.Get(context.Background(), "exp-cp")
+	if err != nil || !ok {
+		t.Fatalf("load: ok=%v err=%v", ok, err)
+	}
+	staleID := snap.CheckpointID
+
+	// Advance the tip with a second writer so expected becomes stale.
+	_, err = g.Resume(context.Background(), "exp-cp", graph.WithCommand(graph.Command{Resume: "first"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = g.Resume(context.Background(), "exp-cp",
+		graph.WithCommand(graph.Command{Resume: "second"}),
+		graph.WithExpectedCheckpointID(staleID),
+	)
+	if !errors.Is(err, graph.ErrExpectedCheckpointMismatch) {
+		t.Fatalf("want ErrExpectedCheckpointMismatch, got %v", err)
 	}
 }
 

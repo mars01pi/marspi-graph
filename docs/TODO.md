@@ -48,7 +48,8 @@ ADR: [0008](./adr/0008-execution-lease.md)
 
 | Priority | Item | Notes |
 |----------|------|-------|
-| — | HTTP idempotent run API / SSE | Service surface |
+| — | HTTP idempotent run API / SSE | See sibling `marspi-service` (Gin Layer 1 MVP) |
+| done | `WithExpectedCheckpointID` on Resume | Service optimistic resume; `ErrExpectedCheckpointMismatch` |
 | — | Async event transport | Sync handler only in P1 |
 | — | Time-travel Resume API | History queryable in P1 |
 | — | Parallel / Send fan-out | Needs reducer-safe executor (ADR 0002) |

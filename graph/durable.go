@@ -13,6 +13,10 @@ import (
 // or an idempotent retry collides with a different existing checkpoint.
 var ErrCheckpointConflict = errors.New("graph: checkpoint conflict")
 
+// ErrExpectedCheckpointMismatch is returned when Resume is asked to continue
+// from a specific checkpoint ID that is no longer the thread's latest.
+var ErrExpectedCheckpointMismatch = errors.New("graph: expected checkpoint mismatch")
+
 // ArtifactAgentSession is the StepArtifact.Kind for agentspec message blobs.
 const ArtifactAgentSession = "agent_session"
 
