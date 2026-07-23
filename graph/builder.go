@@ -9,6 +9,7 @@ import (
 )
 
 // Builder constructs a StateGraph before Compile.
+// Construction mistakes are recorded and returned by Compile (not panicked).
 type Builder struct {
 	mu       sync.Mutex
 	nodes    map[string]NodeFunc
@@ -16,6 +17,7 @@ type Builder struct {
 	routes   map[string]RouteFunc
 	reducers map[string]Reducer
 	entry    string
+	err      error // first construction error; checked by Compile
 }
 
 // NewBuilder creates an empty graph builder.
@@ -28,18 +30,24 @@ func NewBuilder() *Builder {
 	}
 }
 
-// AddNode registers a named node. Panics on duplicate names.
+// AddNode registers a named node.
 func (b *Builder) AddNode(name string, fn NodeFunc) *Builder {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.err != nil {
+		return b
+	}
 	if name == "" || name == START || name == END {
-		panic("graph: invalid node name: " + name)
+		b.err = fmt.Errorf("graph: invalid node name: %q", name)
+		return b
 	}
 	if _, ok := b.nodes[name]; ok {
-		panic("graph: duplicate node: " + name)
+		b.err = fmt.Errorf("graph: duplicate node: %q", name)
+		return b
 	}
 	if fn == nil {
-		panic("graph: nil node func: " + name)
+		b.err = fmt.Errorf("graph: nil node func: %q", name)
+		return b
 	}
 	b.nodes[name] = fn
 	return b
@@ -50,11 +58,16 @@ func (b *Builder) AddNode(name string, fn NodeFunc) *Builder {
 func (b *Builder) AddReducer(key string, r Reducer) *Builder {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.err != nil {
+		return b
+	}
 	if key == "" {
-		panic("graph: empty reducer key")
+		b.err = fmt.Errorf("graph: empty reducer key")
+		return b
 	}
 	if r == nil {
-		panic("graph: nil reducer for " + key)
+		b.err = fmt.Errorf("graph: nil reducer for %q", key)
+		return b
 	}
 	b.reducers[key] = r
 	return b
@@ -72,8 +85,12 @@ func (b *Builder) SetEntry(name string) *Builder {
 func (b *Builder) AddEdge(from, to string) *Builder {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.err != nil {
+		return b
+	}
 	if _, ok := b.routes[from]; ok {
-		panic("graph: node already has conditional route: " + from)
+		b.err = fmt.Errorf("graph: node already has conditional route: %q", from)
+		return b
 	}
 	b.edges[from] = to
 	return b
@@ -83,11 +100,16 @@ func (b *Builder) AddEdge(from, to string) *Builder {
 func (b *Builder) AddConditionalEdges(from string, route RouteFunc) *Builder {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.err != nil {
+		return b
+	}
 	if route == nil {
-		panic("graph: nil route for " + from)
+		b.err = fmt.Errorf("graph: nil route for %q", from)
+		return b
 	}
 	if _, ok := b.edges[from]; ok {
-		panic("graph: node already has fixed edge: " + from)
+		b.err = fmt.Errorf("graph: node already has fixed edge: %q", from)
+		return b
 	}
 	b.routes[from] = route
 	return b
@@ -97,6 +119,10 @@ func (b *Builder) AddConditionalEdges(from string, route RouteFunc) *Builder {
 func (b *Builder) Compile(opts ...CompileOption) (*Compiled, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+
+	if b.err != nil {
+		return nil, b.err
+	}
 
 	cfg := compileConfig{}
 	for _, o := range opts {
@@ -574,7 +600,7 @@ func (g *Compiled) run(ctx context.Context, state State, node string, step int, 
 
 		g.emit(nodeCtx, cfg, Event{Type: EventNodeStart, NodeID: node, Step: step, CheckpointID: parent})
 
-		upd, err := fn(nodeCtx, state)
+		upd, err := callNode(fn, nodeCtx, state)
 		if lost := leaseLostFrom(ctx); lost != nil {
 			// Discard update/artifacts after heartbeat loss.
 			return state, lost
@@ -661,7 +687,10 @@ func (g *Compiled) run(ctx context.Context, state State, node string, step int, 
 
 func (g *Compiled) next(ctx context.Context, from string, s State) (string, error) {
 	if route, ok := g.routes[from]; ok {
-		to := route(ctx, s)
+		to, err := callRoute(route, ctx, s)
+		if err != nil {
+			return "", fmt.Errorf("graph: route from %q: %w", from, err)
+		}
 		if to == "" {
 			return END, nil
 		}
@@ -677,6 +706,26 @@ func (g *Compiled) next(ctx context.Context, from string, s State) (string, erro
 		return END, nil
 	}
 	return to, nil
+}
+
+// callNode invokes fn and converts panics into errors.
+func callNode(fn NodeFunc, ctx context.Context, s State) (upd Update, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("panic: %v", r)
+		}
+	}()
+	return fn(ctx, s)
+}
+
+// callRoute invokes route and converts panics into errors.
+func callRoute(route RouteFunc, ctx context.Context, s State) (to string, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("panic: %v", r)
+		}
+	}()
+	return route(ctx, s), nil
 }
 
 type leaseSession struct {

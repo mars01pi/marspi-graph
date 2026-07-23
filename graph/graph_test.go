@@ -347,6 +347,116 @@ func TestMaxSteps(t *testing.T) {
 	}
 }
 
+func TestBuilderConstructionErrors(t *testing.T) {
+	t.Run("duplicate node", func(t *testing.T) {
+		b := graph.NewBuilder()
+		b.AddNode("a", func(context.Context, graph.State) (graph.Update, error) { return nil, nil })
+		b.AddNode("a", func(context.Context, graph.State) (graph.Update, error) { return nil, nil })
+		b.SetEntry("a")
+		_, err := b.Compile()
+		if err == nil || !strings.Contains(err.Error(), "duplicate node") {
+			t.Fatalf("want duplicate node error, got %v", err)
+		}
+	})
+	t.Run("nil node func", func(t *testing.T) {
+		b := graph.NewBuilder()
+		b.AddNode("a", nil)
+		b.SetEntry("a")
+		_, err := b.Compile()
+		if err == nil || !strings.Contains(err.Error(), "nil node func") {
+			t.Fatalf("want nil node func error, got %v", err)
+		}
+	})
+	t.Run("invalid node name", func(t *testing.T) {
+		b := graph.NewBuilder()
+		b.AddNode(graph.END, func(context.Context, graph.State) (graph.Update, error) { return nil, nil })
+		b.SetEntry(graph.END)
+		_, err := b.Compile()
+		if err == nil || !strings.Contains(err.Error(), "invalid node name") {
+			t.Fatalf("want invalid node name error, got %v", err)
+		}
+	})
+	t.Run("edge conflicts with route", func(t *testing.T) {
+		b := graph.NewBuilder()
+		b.AddNode("a", func(context.Context, graph.State) (graph.Update, error) { return nil, nil })
+		b.SetEntry("a")
+		b.AddConditionalEdges("a", func(context.Context, graph.State) string { return graph.END })
+		b.AddEdge("a", graph.END)
+		_, err := b.Compile()
+		if err == nil || !strings.Contains(err.Error(), "conditional route") {
+			t.Fatalf("want conditional route conflict, got %v", err)
+		}
+	})
+	t.Run("route conflicts with edge", func(t *testing.T) {
+		b := graph.NewBuilder()
+		b.AddNode("a", func(context.Context, graph.State) (graph.Update, error) { return nil, nil })
+		b.SetEntry("a")
+		b.AddEdge("a", graph.END)
+		b.AddConditionalEdges("a", func(context.Context, graph.State) string { return graph.END })
+		_, err := b.Compile()
+		if err == nil || !strings.Contains(err.Error(), "fixed edge") {
+			t.Fatalf("want fixed edge conflict, got %v", err)
+		}
+	})
+	t.Run("nil reducer", func(t *testing.T) {
+		b := graph.NewBuilder()
+		b.AddReducer("logs", nil)
+		b.AddNode("a", func(context.Context, graph.State) (graph.Update, error) { return nil, nil })
+		b.SetEntry("a")
+		b.AddEdge("a", graph.END)
+		_, err := b.Compile()
+		if err == nil || !strings.Contains(err.Error(), "nil reducer") {
+			t.Fatalf("want nil reducer error, got %v", err)
+		}
+	})
+	t.Run("first error wins", func(t *testing.T) {
+		b := graph.NewBuilder()
+		b.AddNode("a", nil)
+		b.AddNode("", nil) // would also fail, but first error is kept
+		b.SetEntry("a")
+		_, err := b.Compile()
+		if err == nil || !strings.Contains(err.Error(), "nil node func") {
+			t.Fatalf("want first error (nil node func), got %v", err)
+		}
+	})
+}
+
+func TestNodePanicRecovered(t *testing.T) {
+	b := graph.NewBuilder()
+	b.AddNode("a", func(context.Context, graph.State) (graph.Update, error) {
+		panic("boom")
+	})
+	b.SetEntry("a")
+	b.AddEdge("a", graph.END)
+	g, err := b.Compile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = g.Invoke(context.Background(), graph.State{})
+	if err == nil || !strings.Contains(err.Error(), "panic: boom") {
+		t.Fatalf("want recovered panic error, got %v", err)
+	}
+}
+
+func TestRoutePanicRecovered(t *testing.T) {
+	b := graph.NewBuilder()
+	b.AddNode("a", func(context.Context, graph.State) (graph.Update, error) {
+		return graph.Update{"ok": true}, nil
+	})
+	b.SetEntry("a")
+	b.AddConditionalEdges("a", func(context.Context, graph.State) string {
+		panic("route boom")
+	})
+	g, err := b.Compile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = g.Invoke(context.Background(), graph.State{})
+	if err == nil || !strings.Contains(err.Error(), "panic: route boom") {
+		t.Fatalf("want recovered route panic, got %v", err)
+	}
+}
+
 func stateIntTest(s graph.State) int {
 	switch v := s["n"].(type) {
 	case int:
