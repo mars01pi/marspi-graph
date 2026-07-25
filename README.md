@@ -76,7 +76,7 @@ out, _ := g.Invoke(ctx, graph.State{"goal": "hello"})
 | `Compiled.Resume(threadID)` | 从最新检查点继续；默认 **graph-only**（ADR 0004） |
 | `WithCommand(Command{Resume: …})` | 恢复时注入外部数据 |
 | `checkpoint.OpenSQLite(path)` | **Legacy** latest-only 文件持久化（CLI） |
-| `checkpoint.OpenMySQL(dsn)` / `NewDurableMemory()` | **P1** append history + AgentStore（ADR 0005/0006） |
+| `checkpoint.New(db)` + `Migrate` / `OpenMySQL(dsn)` / `NewDurableMemory()` | **P1** append history + AgentStore（ADR 0005/0006） |
 | `WithEventHandler(h)` | Graph lifecycle events（ADR 0007） |
 | `WithExecutionLease(l)` | P1.5 执行租约（ADR 0008） |
 | `graph.ToolExecutionFrom` | 工具幂等键 + lease fence token（ADR 0009） |
@@ -87,6 +87,10 @@ cp, _ := checkpoint.OpenSQLite("checkpoints.db")
 g, _ := b.Compile(graph.WithCheckpointer(cp))
 
 // P1 durable (MySQL or in-memory twin)
+// Shared pool (preferred when co-hosting with marspi-service store/mysql):
+//   _ = checkpoint.Migrate(ctx, db)
+//   d := checkpoint.New(db)
+// Or open a dedicated pool:
 d, _ := checkpoint.OpenMySQL(dsn) // or checkpoint.NewDurableMemory()
 g, _ := b.Compile(graph.WithDurableCheckpointer(d))
 out, _ = g.Invoke(ctx, state, graph.WithThreadID(id), graph.WithEventHandler(handler))

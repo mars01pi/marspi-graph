@@ -22,7 +22,7 @@ func TestMySQLDurableIntegration(t *testing.T) {
 	defer m.Close()
 	ctx := context.Background()
 	thread := "test-" + graph.NewID()
-	defer func() { _ = m.DeleteThread(ctx, thread) }()
+	// defer func() { _ = m.DeleteThread(ctx, thread) }()
 
 	s1 := graph.Snapshot{CheckpointID: graph.NewID(), ThreadID: thread, Node: "a", Step: 1, State: graph.State{"v": 1}}
 	if err := m.CommitStep(ctx, s1, nil); err != nil {
@@ -77,6 +77,35 @@ func TestMySQLDurableIntegration(t *testing.T) {
 	list, err := m.List(ctx, thread, 0, 10)
 	if err != nil || len(list) != 1 || list[0].CheckpointID != s3.CheckpointID {
 		t.Fatalf("prune list=%+v err=%v", list, err)
+	}
+}
+
+func TestMySQLNewMigrateSharedDB(t *testing.T) {
+	dsn := os.Getenv("MARSPI_MYSQL_DSN")
+	if dsn == "" {
+		dsn = "root:123456@tcp(127.0.0.1:3306)/marspi?parseTime=true&loc=UTC"
+	}
+	owned, err := OpenMySQL(dsn)
+	if err != nil {
+		t.Skipf("MySQL unavailable (%v); set MARSPI_MYSQL_DSN or start docker/mysql.sh", err)
+	}
+	defer owned.Close()
+
+	// Re-wrap the same pool via New (does not own Close).
+	m := New(owned.db)
+	if err := Migrate(context.Background(), owned.db); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Close(); err != nil {
+		t.Fatalf("Close on injected db should be no-op: %v", err)
+	}
+	// Pool must still be usable after New.Close.
+	ctx := context.Background()
+	thread := "test-shared-" + graph.NewID()
+	defer func() { _ = owned.DeleteThread(ctx, thread) }()
+	s := graph.Snapshot{CheckpointID: graph.NewID(), ThreadID: thread, Node: "a", Step: 1, State: graph.State{"v": 1}}
+	if err := m.CommitStep(ctx, s, nil); err != nil {
+		t.Fatal(err)
 	}
 }
 

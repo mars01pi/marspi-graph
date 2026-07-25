@@ -14,10 +14,27 @@ import (
 
 // MySQL is the P1 durable checkpointer (history + agent sessions).
 type MySQL struct {
-	db *sql.DB
+	db     *sql.DB
+	ownsDB bool // true when opened via OpenMySQL; Close then closes the pool
 }
 
-// OpenMySQL opens a MySQL DurableCheckpointer using DSN and runs migrations.
+// New wraps an opened *sql.DB. Caller owns pool lifecycle (Close is a no-op).
+// Call Migrate before use unless the schema is already applied.
+func New(db *sql.DB) *MySQL {
+	return &MySQL{db: db}
+}
+
+// Migrate applies graph_* schema migrations (idempotent).
+func Migrate(ctx context.Context, db *sql.DB) error {
+	if db == nil {
+		return fmt.Errorf("checkpoint: mysql db is nil")
+	}
+	return (&MySQL{db: db}).migrate(ctx)
+}
+
+// OpenMySQL opens a MySQL DurableCheckpointer using DSN, runs migrations,
+// and owns the pool (Close closes it). Prefer New + Migrate when sharing a
+// *sql.DB with other packages (e.g. marspi-service store/mysql).
 func OpenMySQL(dsn string) (*MySQL, error) {
 	if dsn == "" {
 		return nil, fmt.Errorf("checkpoint: mysql dsn is empty")
@@ -35,17 +52,17 @@ func OpenMySQL(dsn string) (*MySQL, error) {
 	db.SetMaxOpenConns(10)
 	db.SetMaxIdleConns(5)
 	db.SetConnMaxLifetime(time.Hour)
-	m := &MySQL{db: db}
-	if err := m.migrate(context.Background()); err != nil {
+	if err := Migrate(context.Background(), db); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
-	return m, nil
+	return &MySQL{db: db, ownsDB: true}, nil
 }
 
-// Close releases the database handle.
+// Close releases the database handle when this instance owns the pool
+// (OpenMySQL). Injected *sql.DB via New is left open for the caller.
 func (m *MySQL) Close() error {
-	if m == nil || m.db == nil {
+	if m == nil || m.db == nil || !m.ownsDB {
 		return nil
 	}
 	return m.db.Close()

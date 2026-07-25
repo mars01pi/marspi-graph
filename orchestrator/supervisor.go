@@ -127,6 +127,8 @@ func RunSupervisor(ctx context.Context, cfg SupervisorConfig) (SupervisorResult,
 		}
 		workerSet[w.ID] = struct{}{}
 	}
+
+	// 需要人工审批的工具集
 	approvalSet := make(map[string]struct{}, len(cfg.RequireApprovalFor))
 	for _, id := range cfg.RequireApprovalFor {
 		approvalSet[id] = struct{}{}

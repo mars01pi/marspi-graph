@@ -22,7 +22,7 @@ func TestMySQLSupervisorHITLSessionE2E(t *testing.T) {
 	ctx := context.Background()
 	thread := "e2e-sv-" + graph.NewID()
 	defer func() {
-		_ = store.DeleteThread(ctx, thread)
+		// _ = store.DeleteThread(ctx, thread)
 		_ = store.Close()
 	}()
 
