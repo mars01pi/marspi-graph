@@ -170,6 +170,7 @@ func (m *DurableMemory) List(ctx context.Context, threadID string, beforeRevisio
 			CheckpointID: s.CheckpointID,
 			ThreadID:     s.ThreadID,
 			Node:         s.Node,
+			CurrentNode:  s.CurrentNode,
 			Step:         s.Step,
 			Revision:     s.Revision,
 			Interrupt:    s.Interrupt,

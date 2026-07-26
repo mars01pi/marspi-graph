@@ -24,7 +24,7 @@ func TestMySQLDurableIntegration(t *testing.T) {
 	thread := "test-" + graph.NewID()
 	// defer func() { _ = m.DeleteThread(ctx, thread) }()
 
-	s1 := graph.Snapshot{CheckpointID: graph.NewID(), ThreadID: thread, Node: "a", Step: 1, State: graph.State{"v": 1}}
+	s1 := graph.Snapshot{CheckpointID: graph.NewID(), ThreadID: thread, Node: "a", CurrentNode: "start", Step: 1, State: graph.State{"v": 1}}
 	if err := m.CommitStep(ctx, s1, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -36,7 +36,7 @@ func TestMySQLDurableIntegration(t *testing.T) {
 	msgs, _ := json.Marshal([]map[string]any{{"role": "assistant", "content": "ok"}})
 	s2 := graph.Snapshot{
 		CheckpointID: graph.NewID(), ParentCheckpointID: s1.CheckpointID,
-		ThreadID: thread, Node: "b", Step: 2, State: graph.State{"v": 2},
+		ThreadID: thread, Node: "b", CurrentNode: "a", Step: 2, State: graph.State{"v": 2},
 	}
 	if err := m.CommitStep(ctx, s2, []graph.StepArtifact{{
 		Kind: graph.ArtifactAgentSession, Key: "coder", Payload: msgs,
@@ -50,6 +50,12 @@ func TestMySQLDurableIntegration(t *testing.T) {
 	got, ok, err := m.GetLatest(ctx, thread)
 	if err != nil || !ok || got.CheckpointID != s2.CheckpointID {
 		t.Fatalf("latest=%+v ok=%v err=%v", got, ok, err)
+	}
+	if got.CurrentNode != "a" || got.Node != "b" {
+		t.Fatalf("want CurrentNode=a Node=b, got CurrentNode=%q Node=%q", got.CurrentNode, got.Node)
+	}
+	if err := Migrate(ctx, m.db); err != nil {
+		t.Fatalf("migrate idempotent: %v", err)
 	}
 	raw, ok, err := m.GetAgentSession(ctx, thread, s2.CheckpointID, "coder")
 	if err != nil || !ok {

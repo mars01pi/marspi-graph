@@ -11,6 +11,7 @@ import (
 )
 
 func TestLinearGraph(t *testing.T) {
+	cp := checkpoint.NewMemory()
 	b := graph.NewBuilder()
 	b.AddNode("a", func(ctx context.Context, s graph.State) (graph.Update, error) {
 		return graph.Update{"v": s.GetString("v") + "A"}, nil
@@ -22,7 +23,7 @@ func TestLinearGraph(t *testing.T) {
 	b.AddEdge("a", "b")
 	b.AddEdge("b", graph.END)
 
-	g, err := b.Compile(graph.WithCheckpointer(checkpoint.NewMemory()))
+	g, err := b.Compile(graph.WithCheckpointer(cp))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -32,6 +33,13 @@ func TestLinearGraph(t *testing.T) {
 	}
 	if out.GetString("v") != "AB" {
 		t.Fatalf("got %q", out.GetString("v"))
+	}
+	snap, ok, err := cp.Get(context.Background(), "t1")
+	if err != nil || !ok {
+		t.Fatalf("checkpoint ok=%v err=%v", ok, err)
+	}
+	if snap.Node != graph.END || snap.CurrentNode != "b" {
+		t.Fatalf("want Node=END CurrentNode=b, got Node=%q CurrentNode=%q", snap.Node, snap.CurrentNode)
 	}
 }
 
@@ -130,6 +138,13 @@ func TestInterruptAndResume(t *testing.T) {
 	if !ok || ie.Value != "need-approval" || ie.Node != "ask" {
 		t.Fatalf("interrupt=%#v ok=%v", ie, ok)
 	}
+	snap, ok, err := cp.Get(context.Background(), "hitl-001")
+	if err != nil || !ok {
+		t.Fatalf("checkpoint ok=%v err=%v", ok, err)
+	}
+	if snap.Node != "ask" || snap.CurrentNode != "ask" || !snap.Interrupt {
+		t.Fatalf("interrupt snap Node=%q CurrentNode=%q Interrupt=%v", snap.Node, snap.CurrentNode, snap.Interrupt)
+	}
 
 	out, err := g.Resume(context.Background(), "hitl-001", graph.WithCommand(graph.Command{
 		Resume: "approve",
@@ -142,6 +157,13 @@ func TestInterruptAndResume(t *testing.T) {
 	}
 	if out["ok"] != true {
 		t.Fatalf("ok=%v", out["ok"])
+	}
+	snap, ok, err = cp.Get(context.Background(), "hitl-001")
+	if err != nil || !ok {
+		t.Fatalf("final checkpoint ok=%v err=%v", ok, err)
+	}
+	if snap.Node != graph.END || snap.CurrentNode != "done" {
+		t.Fatalf("final snap Node=%q CurrentNode=%q", snap.Node, snap.CurrentNode)
 	}
 }
 

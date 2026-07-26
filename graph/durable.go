@@ -33,6 +33,7 @@ type SnapshotMeta struct {
 	CheckpointID string
 	ThreadID     string
 	Node         string
+	CurrentNode  string
 	Step         int
 	Revision     int64
 	Interrupt    bool

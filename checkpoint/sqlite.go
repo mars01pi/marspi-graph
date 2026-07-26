@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/mars/marspi-graph/graph"
@@ -19,11 +20,12 @@ type SQLite struct {
 
 // SnapshotMeta is a lightweight row for listing interrupted threads.
 type SnapshotMeta struct {
-	ThreadID  string
-	Node      string
-	Step      int
-	Interrupt bool
-	UpdatedAt time.Time
+	ThreadID    string
+	Node        string
+	CurrentNode string
+	Step        int
+	Interrupt   bool
+	UpdatedAt   time.Time
 }
 
 // OpenSQLite opens (or creates) a SQLite checkpointer at path.
@@ -53,6 +55,7 @@ func (s *SQLite) setup() error {
 		`CREATE TABLE IF NOT EXISTS checkpoints (
 			thread_id       TEXT PRIMARY KEY,
 			node            TEXT NOT NULL,
+			current_node    TEXT NOT NULL DEFAULT '',
 			step            INTEGER NOT NULL,
 			interrupt       INTEGER NOT NULL DEFAULT 0,
 			interrupt_value TEXT,
@@ -63,6 +66,12 @@ func (s *SQLite) setup() error {
 	for _, q := range stmts {
 		if _, err := s.db.Exec(q); err != nil {
 			return fmt.Errorf("checkpoint: setup: %w", err)
+		}
+	}
+	// Idempotent for DBs created before current_node existed.
+	if _, err := s.db.Exec(`ALTER TABLE checkpoints ADD COLUMN current_node TEXT NOT NULL DEFAULT ''`); err != nil {
+		if !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+			return fmt.Errorf("checkpoint: setup current_node: %w", err)
 		}
 	}
 	return nil
@@ -102,16 +111,17 @@ func (s *SQLite) Put(ctx context.Context, threadID string, snap graph.Snapshot) 
 		interrupt = 1
 	}
 	_, err = s.db.ExecContext(ctx, `
-		INSERT INTO checkpoints (thread_id, node, step, interrupt, interrupt_value, state_json, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO checkpoints (thread_id, node, current_node, step, interrupt, interrupt_value, state_json, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(thread_id) DO UPDATE SET
 			node = excluded.node,
+			current_node = excluded.current_node,
 			step = excluded.step,
 			interrupt = excluded.interrupt,
 			interrupt_value = excluded.interrupt_value,
 			state_json = excluded.state_json,
 			updated_at = excluded.updated_at
-	`, threadID, snap.Node, snap.Step, interrupt, nullableJSON(ivJSON), string(stateJSON), time.Now().Unix())
+	`, threadID, snap.Node, snap.CurrentNode, snap.Step, interrupt, nullableJSON(ivJSON), string(stateJSON), time.Now().Unix())
 	if err != nil {
 		return fmt.Errorf("checkpoint: put: %w", err)
 	}
@@ -128,14 +138,14 @@ func nullableJSON(b []byte) any {
 // Get loads the latest snapshot for threadID.
 func (s *SQLite) Get(ctx context.Context, threadID string) (graph.Snapshot, bool, error) {
 	var (
-		node, stateJSON string
-		step, interrupt int
-		ivSQL           sql.NullString
+		node, currentNode, stateJSON string
+		step, interrupt              int
+		ivSQL                        sql.NullString
 	)
 	err := s.db.QueryRowContext(ctx, `
-		SELECT node, step, interrupt, interrupt_value, state_json
+		SELECT node, current_node, step, interrupt, interrupt_value, state_json
 		FROM checkpoints WHERE thread_id = ?
-	`, threadID).Scan(&node, &step, &interrupt, &ivSQL, &stateJSON)
+	`, threadID).Scan(&node, &currentNode, &step, &interrupt, &ivSQL, &stateJSON)
 	if err == sql.ErrNoRows {
 		return graph.Snapshot{}, false, nil
 	}
@@ -151,11 +161,12 @@ func (s *SQLite) Get(ctx context.Context, threadID string) (graph.Snapshot, bool
 		state = graph.State{}
 	}
 	snap := graph.Snapshot{
-		ThreadID:  threadID,
-		Node:      node,
-		State:     state,
-		Step:      step,
-		Interrupt: interrupt != 0,
+		ThreadID:    threadID,
+		Node:        node,
+		CurrentNode: currentNode,
+		State:       state,
+		Step:        step,
+		Interrupt:   interrupt != 0,
 	}
 	if ivSQL.Valid && ivSQL.String != "" {
 		var iv any
@@ -189,7 +200,7 @@ func (s *SQLite) ListResumable(ctx context.Context) ([]SnapshotMeta, error) {
 
 func (s *SQLite) list(ctx context.Context, where string, args ...any) ([]SnapshotMeta, error) {
 	q := `
-		SELECT thread_id, node, step, interrupt, updated_at
+		SELECT thread_id, node, current_node, step, interrupt, updated_at
 		FROM checkpoints WHERE ` + where + `
 		ORDER BY updated_at DESC`
 	rows, err := s.db.QueryContext(ctx, q, args...)
@@ -203,7 +214,7 @@ func (s *SQLite) list(ctx context.Context, where string, args ...any) ([]Snapsho
 		var m SnapshotMeta
 		var interrupt int
 		var updated int64
-		if err := rows.Scan(&m.ThreadID, &m.Node, &m.Step, &interrupt, &updated); err != nil {
+		if err := rows.Scan(&m.ThreadID, &m.Node, &m.CurrentNode, &m.Step, &interrupt, &updated); err != nil {
 			return nil, fmt.Errorf("checkpoint: list scan: %w", err)
 		}
 		m.Interrupt = interrupt != 0

@@ -67,7 +67,7 @@ func TestPipelineInterruptResume(t *testing.T) {
 	}
 
 	snap, ok, err := cp.Get(context.Background(), thread)
-	if err != nil || !ok || snap.Node != "approve" || !snap.Interrupt {
+	if err != nil || !ok || snap.Node != "approve" || snap.CurrentNode != "approve" || !snap.Interrupt {
 		t.Fatalf("checkpoint=%+v ok=%v err=%v", snap, ok, err)
 	}
 	if snap.State.GetString("draft") != "hello" {

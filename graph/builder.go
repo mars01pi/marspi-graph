@@ -259,7 +259,8 @@ type Snapshot struct {
 	Revision           int64
 	CreatedAt          time.Time
 	ThreadID           string
-	Node               string // next node to run (or current if Interrupt)
+	Node               string // next to run / interrupt re-enter (Resume cursor)
+	CurrentNode        string // node just completed or interrupted (observability only)
 	State              State
 	Step               int
 	Interrupt          bool
@@ -616,6 +617,7 @@ func (g *Compiled) run(ctx context.Context, state State, node string, step int, 
 				ParentCheckpointID: parent,
 				ThreadID:           cfg.threadID,
 				Node:               node, // re-enter same node on Resume
+				CurrentNode:        node,
 				State:              state.Clone(),
 				Step:               step,
 				Interrupt:          true,
@@ -628,7 +630,7 @@ func (g *Compiled) run(ctx context.Context, state State, node string, step int, 
 				return state, putErr
 			}
 			parent = snap.CheckpointID
-			g.emit(nodeCtx, cfg, Event{Type: EventCheckpoint, NodeID: node, Step: step, CheckpointID: snap.CheckpointID, Metadata: map[string]string{"interrupt": "true"}})
+			g.emit(nodeCtx, cfg, Event{Type: EventCheckpoint, NodeID: node, Step: step, CheckpointID: snap.CheckpointID, Metadata: map[string]string{"interrupt": "true", "current": node}})
 			g.emit(nodeCtx, cfg, Event{Type: EventInterrupt, NodeID: node, Step: step, CheckpointID: snap.CheckpointID})
 			return state, ie
 		}
@@ -663,6 +665,7 @@ func (g *Compiled) run(ctx context.Context, state State, node string, step int, 
 				ParentCheckpointID: parent,
 				ThreadID:           cfg.threadID,
 				Node:               next,
+				CurrentNode:        node,
 				State:              state.Clone(),
 				Step:               step,
 				Interrupt:          false,
@@ -675,7 +678,7 @@ func (g *Compiled) run(ctx context.Context, state State, node string, step int, 
 			}
 			parent = snap.CheckpointID
 			ctx = WithParentCheckpointID(ctx, parent)
-			g.emit(nodeCtx, cfg, Event{Type: EventCheckpoint, NodeID: node, Step: step, CheckpointID: snap.CheckpointID, Metadata: map[string]string{"next": next}})
+			g.emit(nodeCtx, cfg, Event{Type: EventCheckpoint, NodeID: node, Step: step, CheckpointID: snap.CheckpointID, Metadata: map[string]string{"next": next, "current": node}})
 		}
 		node = next
 		if cfg.maxSteps > 0 && step >= cfg.maxSteps {

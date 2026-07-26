@@ -17,6 +17,7 @@ func TestDurableMemoryHistoryCASAndPrune(t *testing.T) {
 		CheckpointID: "c1",
 		ThreadID:     "t1",
 		Node:         "a",
+		CurrentNode:  "start",
 		Step:         1,
 		State:        graph.State{"v": 1},
 	}
@@ -43,6 +44,7 @@ func TestDurableMemoryHistoryCASAndPrune(t *testing.T) {
 		ParentCheckpointID: "c1",
 		ThreadID:           "t1",
 		Node:               "b",
+		CurrentNode:        "a",
 		Step:               2,
 		State:              graph.State{"v": 2},
 	}
@@ -76,6 +78,7 @@ func TestDurableMemoryHistoryCASAndPrune(t *testing.T) {
 		ParentCheckpointID: "c2",
 		ThreadID:           "t1",
 		Node:               graph.END,
+		CurrentNode:        "b",
 		Step:               3,
 		State:              graph.State{"v": 3},
 	}
@@ -90,6 +93,13 @@ func TestDurableMemoryHistoryCASAndPrune(t *testing.T) {
 	list, err := m.List(ctx, "t1", 0, 10)
 	if err != nil || len(list) != 3 {
 		t.Fatalf("list len=%d err=%v", len(list), err)
+	}
+	if list[0].CurrentNode != "b" || list[0].Node != graph.END {
+		t.Fatalf("list[0]=%+v", list[0])
+	}
+	got, ok, err = m.GetByID(ctx, "t1", "c2")
+	if err != nil || !ok || got.CurrentNode != "a" || got.Node != "b" {
+		t.Fatalf("c2=%+v ok=%v err=%v", got, ok, err)
 	}
 
 	if err := m.Prune(ctx, "t1", 1); err != nil {

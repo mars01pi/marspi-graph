@@ -24,10 +24,11 @@ func TestSQLitePutGetRoundTrip(t *testing.T) {
 	}
 
 	in := graph.Snapshot{
-		ThreadID: "t1",
-		Node:     "coder",
-		Step:     3,
-		Interrupt: true,
+		ThreadID:    "t1",
+		Node:        "coder",
+		CurrentNode: "coder",
+		Step:        3,
+		Interrupt:   true,
 		InterruptValue: map[string]any{
 			"worker": "coder",
 			"task":   "add comment",
@@ -51,7 +52,7 @@ func TestSQLitePutGetRoundTrip(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("ok=%v err=%v", ok, err)
 	}
-	if got.Node != "coder" || got.Step != 3 || !got.Interrupt || got.ThreadID != "t1" {
+	if got.Node != "coder" || got.CurrentNode != "coder" || got.Step != 3 || !got.Interrupt || got.ThreadID != "t1" {
 		t.Fatalf("meta: %+v", got)
 	}
 	if got.State.GetString("goal") != "ship it" {

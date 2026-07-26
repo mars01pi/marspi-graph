@@ -91,6 +91,7 @@ func (m *MySQL) migrate(ctx context.Context) error {
 			parent_checkpoint_id CHAR(32) NULL COMMENT '父检查点 ID；首步为空，用于 CAS',
 			revision BIGINT NOT NULL COMMENT '线程内单调递增版本（从 1 起）',
 			node VARCHAR(191) NOT NULL COMMENT '下一步要跑的节点（中断时为当前节点）',
+			current_node VARCHAR(191) NOT NULL DEFAULT '' COMMENT '本步刚完成或中断的节点（观测用）',
 			step BIGINT NOT NULL COMMENT '已完成的 super-step 计数',
 			interrupted BOOLEAN NOT NULL COMMENT '是否因 Interrupt/HITL 暂停',
 			interrupt_value JSON NULL COMMENT '中断载荷（审批信息等）',
@@ -142,7 +143,10 @@ func (m *MySQL) migrate(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	return m.migrateLeaseV2(ctx)
+	if err := m.migrateLeaseV2(ctx); err != nil {
+		return err
+	}
+	return m.migrateCurrentNodeV3(ctx)
 }
 
 func (m *MySQL) migrateLeaseV2(ctx context.Context) error {
@@ -162,6 +166,23 @@ func (m *MySQL) migrateLeaseV2(ctx context.Context) error {
 	}
 	_, err := m.db.ExecContext(ctx, `
 		INSERT IGNORE INTO schema_migrations (version, applied_at) VALUES (2, UTC_TIMESTAMP(6))
+	`)
+	return err
+}
+
+func (m *MySQL) migrateCurrentNodeV3(ctx context.Context) error {
+	_, err := m.db.ExecContext(ctx, `
+		ALTER TABLE graph_checkpoints
+		ADD COLUMN current_node VARCHAR(191) NOT NULL DEFAULT '' COMMENT '本步刚完成或中断的节点（观测用）'
+	`)
+	if err != nil {
+		var me *mysql.MySQLError
+		if !(errors.As(err, &me) && me.Number == 1060) { // Duplicate column
+			return fmt.Errorf("checkpoint: mysql current_node migrate: %w", err)
+		}
+	}
+	_, err = m.db.ExecContext(ctx, `
+		INSERT IGNORE INTO schema_migrations (version, applied_at) VALUES (3, UTC_TIMESTAMP(6))
 	`)
 	return err
 }
@@ -327,9 +348,9 @@ func (m *MySQL) commitStep(ctx context.Context, snap graph.Snapshot, artifacts [
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO graph_checkpoints (
 			checkpoint_id, thread_id, parent_checkpoint_id, revision,
-			node, step, interrupted, interrupt_value, state_json, created_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, snap.CheckpointID, snap.ThreadID, parent, rev, snap.Node, snap.Step,
+			node, current_node, step, interrupted, interrupt_value, state_json, created_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, snap.CheckpointID, snap.ThreadID, parent, rev, snap.Node, snap.CurrentNode, snap.Step,
 		snap.Interrupt, ivJSON, string(stateJSON), snap.CreatedAt)
 	if err != nil {
 		return fmt.Errorf("checkpoint: insert checkpoint: %w", err)
@@ -400,21 +421,22 @@ func (m *MySQL) GetLatest(ctx context.Context, threadID string) (graph.Snapshot,
 // GetByID returns a specific checkpoint.
 func (m *MySQL) GetByID(ctx context.Context, threadID, checkpointID string) (graph.Snapshot, bool, error) {
 	var (
-		parent    sql.NullString
-		revision  int64
-		node      string
-		step      int64
-		interrupt bool
-		ivSQL     sql.NullString
-		stateJSON string
-		created   time.Time
+		parent      sql.NullString
+		revision    int64
+		node        string
+		currentNode string
+		step        int64
+		interrupt   bool
+		ivSQL       sql.NullString
+		stateJSON   string
+		created     time.Time
 	)
 	err := m.db.QueryRowContext(ctx, `
-		SELECT parent_checkpoint_id, revision, node, step, interrupted,
+		SELECT parent_checkpoint_id, revision, node, current_node, step, interrupted,
 		       interrupt_value, state_json, created_at
 		FROM graph_checkpoints
 		WHERE checkpoint_id = ? AND thread_id = ?
-	`, checkpointID, threadID).Scan(&parent, &revision, &node, &step, &interrupt, &ivSQL, &stateJSON, &created)
+	`, checkpointID, threadID).Scan(&parent, &revision, &node, &currentNode, &step, &interrupt, &ivSQL, &stateJSON, &created)
 	if errors.Is(err, sql.ErrNoRows) {
 		return graph.Snapshot{}, false, nil
 	}
@@ -433,6 +455,7 @@ func (m *MySQL) GetByID(ctx context.Context, threadID, checkpointID string) (gra
 		ThreadID:     threadID,
 		Revision:     revision,
 		Node:         node,
+		CurrentNode:  currentNode,
 		Step:         int(step),
 		Interrupt:    interrupt,
 		State:        state,
@@ -454,7 +477,7 @@ func (m *MySQL) GetByID(ctx context.Context, threadID, checkpointID string) (gra
 // List returns history newest-first.
 func (m *MySQL) List(ctx context.Context, threadID string, beforeRevision, limit int64) ([]graph.SnapshotMeta, error) {
 	q := `
-		SELECT checkpoint_id, thread_id, node, step, revision, interrupted, created_at
+		SELECT checkpoint_id, thread_id, node, current_node, step, revision, interrupted, created_at
 		FROM graph_checkpoints WHERE thread_id = ?`
 	args := []any{threadID}
 	if beforeRevision > 0 {
@@ -475,7 +498,7 @@ func (m *MySQL) List(ctx context.Context, threadID string, beforeRevision, limit
 	for rows.Next() {
 		var meta graph.SnapshotMeta
 		var step int64
-		if err := rows.Scan(&meta.CheckpointID, &meta.ThreadID, &meta.Node, &step, &meta.Revision, &meta.Interrupt, &meta.CreatedAt); err != nil {
+		if err := rows.Scan(&meta.CheckpointID, &meta.ThreadID, &meta.Node, &meta.CurrentNode, &step, &meta.Revision, &meta.Interrupt, &meta.CreatedAt); err != nil {
 			return nil, fmt.Errorf("checkpoint: list scan: %w", err)
 		}
 		meta.Step = int(step)

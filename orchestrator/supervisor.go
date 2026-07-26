@@ -198,6 +198,7 @@ func RunSupervisor(ctx context.Context, cfg SupervisorConfig) (SupervisorResult,
 				task = s.GetString("goal")
 			}
 			if needApproval {
+				// 中断的消息内容
 				payload := map[string]any{
 					"worker": w.ID,
 					"task":   task,
