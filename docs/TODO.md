@@ -44,6 +44,32 @@ ADR: [0008](./adr/0008-execution-lease.md)
 | done | Concurrency / HITL / fence tests | Memory default; MySQL opt-in via `MARSPI_MYSQL_DSN` |
 | done | ToolExecution + core ContextualTool bridge | ADR 0009; bash/MCP honor ctx |
 
+## P2 Eval Runtime
+
+Design: [`docs/design/p2-eval-runtime.md`](./design/p2-eval-runtime.md)  
+ADR: [0010](./adr/0010-eval-trace-contract.md)
+
+| Status | Item | Notes |
+|--------|------|-------|
+| draft | Design + ADR 0010 | Trace/Span/Golden contract; Collector; DeepEval sidecar |
+| — | `marspi-eval` schema + Collector + JSON export | Sibling module; no graph/core import reverse |
+| — | CodingLoop / Supervisor collector wiring + deterministic metrics | In-process runner |
+| — | Service worker opt-in export + HTTP runner | `metadata` default in prod |
+| — | Python DeepEval adapter + nightly CI | TaskCompletion / GEval on JSONL |
+| — | Approvals → feedback / golden promotion | HITL label loop |
+
+## P3 Spawn Tool
+
+Design: [`docs/design/p3-spawn-tool.md`](./design/p3-spawn-tool.md)  
+ADR: [0011](./adr/0011-spawn-tool.md)
+
+| Status | Item | Notes |
+|--------|------|-------|
+| done | Design + ADR 0011 | Spawn ≠ Supervisor handoff |
+| done | `agentspec.RegisterSpawn` + `spawn` ContextualTool | Fresh child `RunOnce`; depth guard |
+| done | Unit tests (`spawn_test.go`) | Isolation / depth / cancel / truncate |
+| — | CLI wiring | Deferred — register on main agent Registry |
+
 ## Deferred product work (later)
 
 | Priority | Item | Notes |

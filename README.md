@@ -17,7 +17,7 @@ Consumed by `marspi-cli` (and later platform services).
 |------|------|
 | [`graph`](./graph/) | **StateGraph 引擎**：节点、边、Reducer、Invoke/Resume、Interrupt、Events |
 | [`checkpoint`](./checkpoint/) | **检查点**：Memory / SQLite（legacy latest-only）+ MySQL / DurableMemory（P1 history） |
-| [`agentspec`](./agentspec/) | **Agent 工厂**：包装 core.Runner；可选 `PersistSession` |
+| [`agentspec`](./agentspec/) | **Agent 工厂**：包装 core.Runner；可选 `PersistSession`；**Spawn**（`RegisterSpawn` 子 agent tool） |
 | [`orchestrator`](./orchestrator/) | **预设模式**：Pipeline、CodingLoop、Supervisor |
 
 ---
@@ -110,6 +110,18 @@ req.Header.Set("X-Marspi-Lease-Epoch", strconv.FormatInt(exec.FenceToken(), 10))
 ```
 
 agentspec 已把 graph context 注入 `Runner.ToolMeta`；bash/MCP 会遵守父 `ctx` 取消。详见 ADR 0009。
+
+### Spawn — 子 Agent tool（agentspec）
+
+与 Supervisor **handoff**（图边交棒）不同：`agentspec.RegisterSpawn` 在父 Registry 上注册 `spawn` tool，同步跑一个 **fresh** 子 `Instance.RunOnce`，只把 summary 回给父。详见 [ADR 0011](docs/adr/0011-spawn-tool.md)、[`docs/design/p3-spawn-tool.md`](docs/design/p3-spawn-tool.md)。
+
+```go
+_ = agentspec.RegisterSpawn(registry, provider, agentspec.SpawnConfig{
+    Children: []agentspec.ChildSpec{
+        {ID: "explore", Description: "codebase scout", AllowTools: []string{"read", "grep"}},
+    },
+})
+```
 
 ---
 
