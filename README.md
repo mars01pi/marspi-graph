@@ -4,7 +4,7 @@
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue)](LICENSE)
 [![LangGraph-Style](https://img.shields.io/badge/Pattern-LangGraph%20Style-7B68EE)](https://github.com/langchain-ai/langgraph)
 
-> LangGraph 风格的多智能体编排引擎 — StateGraph、Checkpointer、Pipeline、CodingLoop、Supervisor
+> LangGraph 风格的多智能体编排引擎 — StateGraph、Checkpointer、Pipeline、CodingLoop、Supervisor、**Workflow Spec**
 
 Depends on [`marspi-core`](../marspi-core) for the single-agent ReAct runtime.
 Consumed by `marspi-cli` (and later platform services).
@@ -19,6 +19,8 @@ Consumed by `marspi-cli` (and later platform services).
 | [`checkpoint`](./checkpoint/) | **检查点**：Memory / SQLite（legacy latest-only）+ MySQL / DurableMemory（P1 history） |
 | [`agentspec`](./agentspec/) | **Agent 工厂**：包装 core.Runner；可选 `PersistSession`；**Spawn**（`RegisterSpawn` 子 agent tool） |
 | [`orchestrator`](./orchestrator/) | **预设模式**：Pipeline、CodingLoop、Supervisor |
+| [`component`](./component/) | **节点 SDK**：代码实体（Agent/Approval）；`Schemas()` → 画布 |
+| [`workflow`](./workflow/) | **薄工作流实例**：topology + bindings → Compile；内置 DevFlow |
 
 ---
 
@@ -32,7 +34,7 @@ go build ./...
 go test ./...
 ```
 
-> `marspi-graph` 是库项目，不提供独立二进制。通过 `marspi-cli` 的 `/loopg` 和 `/supervise` 命令使用。
+> `marspi-graph` 是库项目，不提供独立二进制。通过 `marspi-cli` 的 `/loopg`、`/supervise`、`/devflow`（`/df`）使用。
 
 ---
 
@@ -193,6 +195,24 @@ HITL：`RequireApprovalFor` 中的 worker 入口会 `Interrupt`；`OnInterrupt` 
                                ▼
                         next=END → 完成
 ```
+
+### Workflow Spec — 可配置流水线（画布契约）
+
+**节点类型**用代码实体（[`component`](./component/)）：`Agent` / `Approval` 声明 inputs/outputs，`component.Default.Schemas()` 给画布面板。扩节点 = 注册新 Component，不是写 YAML 说明书。
+
+**工作流实例**是薄 Spec：只存 `component` id + `bindings` + edges。Publish 快照仍是这份实例图（对齐 service ADR 0001）。
+
+```go
+schemas := workflow.ComponentSchemas() // 画布组件库
+spec, _ := workflow.Builtin("devflow")  // 或 LoadSpec("flow.yaml")
+res, _ := workflow.Run(ctx, spec, workflow.Bindings{Goal: "...", Provider: p, Registry: r})
+```
+
+内置 **`devflow`**：Design→Develop→Review→Test→Push（rework + Approval HITL）。
+
+> 对应 `marspi-cli`：`/df <goal>`、`/df --workflow path.yaml <goal>`、`/df --no-push`、`/df resume`、`/df list`。
+
+**范围**：静态边 + 命名条件路由。Supervisor 仍用 `orchestrator.RunSupervisor`（或日后 `Supervisor` Component）。
 
 ---
 

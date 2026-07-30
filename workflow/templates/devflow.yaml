@@ -1,0 +1,150 @@
+id: devflow
+entry: design
+reducers:
+  messages: append_slice
+nodes:
+  - id: design
+    component: agent
+    bindings:
+      allow_tools: [read, grep, search, attempt_completion]
+      system_prompt: |
+        You are the DESIGNER. Explore the codebase and produce a concise design doc.
+        Include a checklist of dimensions (store, UI, utils, styles, i18n, etc.) mapped to planned files.
+        Do not edit files. Call attempt_completion with the full design doc.
+      extractors:
+        - to: design_doc
+          from: completion
+      outputs:
+        - name: design_doc
+          label: Design Doc
+  - id: develop
+    component: agent
+    bindings:
+      persist: session
+      spawn: [explore]
+      system_prompt: |
+        You are the DEVELOPER. Implement the goal using the design doc.
+        Prefer smallest working changes. Call attempt_completion when done.
+        Do not run the full test suite here.
+      user_prompt: |
+        GOAL: {{start.goal}}
+        PHASE: develop
+
+        DESIGN_DOC (from design):
+        {{design.design_doc}}
+
+        PREVIOUS REVIEW (if any):
+        {{review.review_result}}
+
+        PREVIOUS TEST (if any):
+        {{test.test_result}}
+
+        Call attempt_completion when done.
+      extractors:
+        - to: changed_files
+          from: tool_calls
+          tools: [edit, write]
+      outputs:
+        - name: changed_files
+          label: Changed Files
+  - id: review
+    component: agent
+    bindings:
+      allow_tools: [read, grep, search, attempt_completion]
+      system_prompt: |
+        You are the REVIEWER. Compare implementation against DESIGN_DOC.
+        Call attempt_completion with one line: REVIEW: PASS or REVIEW: FAIL: <gaps>.
+      user_prompt: |
+        GOAL: {{goal}}
+        DESIGN_DOC:
+        {{design.design_doc}}
+        CHANGED_FILES:
+        {{develop.changed_files}}
+        Call attempt_completion with REVIEW: PASS or REVIEW: FAIL.
+      extractors:
+        - to: review_result
+          from: completion
+      outputs:
+        - name: review_result
+          label: Review Verdict
+  - id: test
+    component: agent
+    bindings:
+      allow_tools: [read, grep, search, bash, attempt_completion]
+      system_prompt: |
+        You are the TESTER. Inspect the project, run appropriate tests via bash.
+        Call attempt_completion with one line: TEST: PASS or TEST: FAIL: <reason>.
+      user_prompt: |
+        GOAL: {{goal}}
+        CHANGED_FILES:
+        {{develop.changed_files}}
+        Call attempt_completion with TEST: PASS or TEST: FAIL.
+      extractors:
+        - to: test_result
+          from: completion
+      outputs:
+        - name: test_result
+          label: Test Verdict
+  - id: push_gate
+    component: approval
+    bindings:
+      require_approval: true
+      title: "Push approval: {{start.goal}}"
+      summary: |
+        Review: {{review.review_result}}
+        Test: {{test.test_result}}
+        Files: {{develop.changed_files}}
+  - id: push
+    component: agent
+    bindings:
+      allow_tools: [bash, read, attempt_completion]
+      system_prompt: |
+        You are the PUSHER. Create a branch if needed, commit changes with a clear message,
+        push, and open a PR with gh when available. Summarize the PR URL.
+        Call attempt_completion with the push/PR summary.
+      user_prompt: |
+        GOAL: {{goal}}
+        CHANGED_FILES:
+        {{develop.changed_files}}
+        Call attempt_completion with the PR/push summary.
+      extractors:
+        - to: changed_files
+          from: tool_calls
+          tools: [edit, write]
+        - to: push_result
+          from: completion
+        - to: status
+          from: const
+          value: success
+      outputs:
+        - name: push_result
+          label: Push Result
+        - name: status
+          label: Status
+edges:
+  - from: design
+    to: develop
+  - from: develop
+    to: review
+  - from: review
+    route: pass_fail_rework
+    key: review_result
+    pass: test
+    fail: develop
+    count_key: rework_count
+    max_key: max_rework
+    exhausted: END
+  - from: test
+    route: pass_fail_rework
+    key: test_result
+    pass: push_gate
+    fail: develop
+    count_key: rework_count
+    max_key: max_rework
+    exhausted: END
+  - from: push_gate
+    route: approval
+    approved: push
+    denied: END
+  - from: push
+    to: END

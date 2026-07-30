@@ -70,6 +70,17 @@ ADR: [0011](./adr/0011-spawn-tool.md)
 | done | Unit tests (`spawn_test.go`) | Isolation / depth / cancel / truncate |
 | — | CLI wiring | Deferred — register on main agent Registry |
 
+## Workflow Spec + DevFlow
+
+| Status | Item | Notes |
+|--------|------|-------|
+| done | `component` SDK（Agent / Approval） | 代码实体 = 节点类型；`Schemas()` 给画布 |
+| done | 薄 `workflow.Spec`（component + bindings） | topology only；Compile 走 Registry |
+| done | Builtin `devflow` 薄模板 | Design→…→Push；AllowPush；`{{refs}}` |
+| done | CLI `/df` `/devflow` | goal、`--workflow`、`--no-push`、resume、list |
+| — | Control-plane publish → service registry | 实例图作为 `graph_id` 快照 |
+| — | 自定义 Component 热加载 / AI 生成校验 | Registry.Register；后续 SDK 文档 |
+
 ## Deferred product work (later)
 
 | Priority | Item | Notes |
