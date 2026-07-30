@@ -15,7 +15,7 @@ Consumed by `marspi-cli` (and later platform services).
 
 | 包 | 角色 |
 |------|------|
-| [`graph`](./graph/) | **StateGraph 引擎**：节点、边、Reducer、Invoke/Resume、Interrupt、Events |
+| [`graph`](./graph/) | **StateGraph 引擎**：节点、边、Reducer、Invoke/Resume、Interrupt、Retry/on_error、Events |
 | [`checkpoint`](./checkpoint/) | **检查点**：Memory / SQLite（legacy latest-only）+ MySQL / DurableMemory（P1 history） |
 | [`agentspec`](./agentspec/) | **Agent 工厂**：包装 core.Runner；可选 `PersistSession`；**Spawn**（`RegisterSpawn` 子 agent tool） |
 | [`orchestrator`](./orchestrator/) | **预设模式**：Pipeline、CodingLoop、Supervisor |
@@ -49,6 +49,7 @@ go test ./...
 | **Edge** | 从一个节点到另一节点的有向连接 |
 | **Conditional Edge** | `func(ctx, State) → string`，根据状态动态选择下一节点 |
 | **Reducer** | `AddReducer(key, fn)` — 默认 last-write-wins；`AppendSlice` 用于列表合并 |
+| **Retry / on_error** | `WithRetry(RetryPolicy)` 同节点重试；`SetOnError` 耗尽后旁路（`error_node`/`last_error`/`status=failed`），见 ADR 0012 |
 
 ### 典型用法
 
@@ -209,6 +210,8 @@ res, _ := workflow.Run(ctx, spec, workflow.Bindings{Goal: "...", Provider: p, Re
 ```
 
 内置 **`devflow`**：Design→Develop→Review→Test→Push（rework + Approval HITL）。
+
+节点可选 `retry` / `on_error`（硬错重试与旁路；与 PASS/FAIL rework 分离，见 [ADR 0012](./docs/adr/0012-fault-tolerance.md)）。
 
 > 对应 `marspi-cli`：`/df <goal>`、`/df --workflow path.yaml <goal>`、`/df --no-push`、`/df resume`、`/df list`。
 

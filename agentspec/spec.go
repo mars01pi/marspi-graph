@@ -125,18 +125,45 @@ func (a *Instance) ID() string { return a.spec.ID }
 func (a *Instance) Manager() *agentctx.Manager { return a.ctx }
 
 // RunOnce appends userInput, runs the ReAct loop, and returns the last completion text.
+// On error, in-memory messages are restored to the pre-attempt snapshot so retries
+// on a reused Instance do not keep unpersisted attempt turns.
 func (a *Instance) RunOnce(ctx context.Context, userInput string) (string, error) {
 	a.setCorrelation(ctx)
 	if err := a.ensureSession(ctx); err != nil {
 		return "", err
 	}
+	snap := cloneMessages(a.ctx.Messages)
 	if err := a.runner.LoopCtx(ctx, a.ctx, "", userInput); err != nil {
+		a.ctx.Messages = snap
 		return lastCompletion(a.ctx), err
 	}
 	if err := a.registerSessionArtifact(ctx); err != nil {
+		a.ctx.Messages = snap
 		return lastCompletion(a.ctx), err
 	}
 	return lastCompletion(a.ctx), nil
+}
+
+func cloneMessages(in []llm.Message) []llm.Message {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]llm.Message, len(in))
+	for i, m := range in {
+		out[i] = cloneMessage(m)
+	}
+	return out
+}
+
+func cloneMessage(m llm.Message) llm.Message {
+	if m == nil {
+		return nil
+	}
+	out := make(llm.Message, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
 }
 
 func (a *Instance) setCorrelation(ctx context.Context) {

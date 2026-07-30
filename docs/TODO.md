@@ -81,6 +81,18 @@ ADR: [0011](./adr/0011-spawn-tool.md)
 | — | Control-plane publish → service registry | 实例图作为 `graph_id` 快照 |
 | — | 自定义 Component 热加载 / AI 生成校验 | Registry.Register；后续 SDK 文档 |
 
+## P1.6 Fault Tolerance
+
+Design: [`docs/design/p16-fault-tolerance.md`](./design/p16-fault-tolerance.md)  
+ADR: [0012](./adr/0012-fault-tolerance.md)
+
+| Status | Item | Notes |
+|--------|------|-------|
+| done | `graph.RetryPolicy` + `SetOnError` | Same super-step retry; fixed keys on divert |
+| done | agentspec RunOnce message rollback | Clears unpersisted attempt on error |
+| done | Workflow Spec `retry` / `on_error` | Soft complete `status=failed` |
+| — | TimeoutPolicy | Deferred |
+
 ## Deferred product work (later)
 
 | Priority | Item | Notes |

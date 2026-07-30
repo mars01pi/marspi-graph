@@ -80,3 +80,73 @@ func TestAsNodePropagatesError(t *testing.T) {
 		t.Fatal("expected error")
 	}
 }
+
+func TestRunOnceRollbackOnError(t *testing.T) {
+	inst := agentspec.New(agentspec.Spec{
+		ID:           "t",
+		SystemPrompt: "sys",
+		Provider:     llm.NewProvider("gpt-4o", "http://127.0.0.1:1", ""),
+		MaxIter:      1,
+	})
+	before := len(inst.Manager().Messages)
+	_, err := inst.RunOnce(context.Background(), "will-fail")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	after := len(inst.Manager().Messages)
+	if after != before {
+		t.Fatalf("messages not rolled back: before=%d after=%d msgs=%v", before, after, inst.Manager().Messages)
+	}
+}
+
+func TestRunOnceRetryClearsFailedAttempt(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls == 1 {
+			http.Error(w, "fail", http.StatusInternalServerError)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"model": "mock",
+			"choices": []any{map[string]any{
+				"finish_reason": "stop",
+				"message":       map[string]any{"role": "assistant", "content": "recovered"},
+			}},
+			"usage": map[string]any{"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+		})
+	}))
+	defer srv.Close()
+
+	inst := agentspec.New(agentspec.Spec{
+		ID:           "t",
+		SystemPrompt: "sys",
+		Provider:     llm.NewProvider("gpt-4o", srv.URL, "k"),
+		MaxIter:      2,
+	})
+	fn := inst.AsNode("input", "output")
+	b := graph.NewBuilder()
+	b.AddNode("n", fn, graph.WithRetry(graph.RetryPolicy{
+		MaxAttempts:     2,
+		InitialInterval: time.Millisecond,
+		Jitter:          false,
+	}))
+	b.SetEntry("n")
+	b.AddEdge("n", graph.END)
+	g, err := b.Compile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := g.Invoke(context.Background(), graph.State{"input": "hi"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.GetString("output") != "recovered" {
+		t.Fatalf("out=%v", out)
+	}
+	// System + one successful user/assistant turn; no duplicated failed attempt.
+	n := len(inst.Manager().Messages)
+	if n < 2 || n > 4 {
+		t.Fatalf("unexpected message count %d: %v", n, inst.Manager().Messages)
+	}
+}

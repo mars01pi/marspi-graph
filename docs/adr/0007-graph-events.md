@@ -28,7 +28,13 @@ invisible, which blocks durable-runtime debugging and future SSE surfaces.
 6. **Ordering (required):**
    - Success node: `node_start → node_end → route → checkpoint`
    - Interrupt: `node_start → checkpoint → interrupt → run_end(paused)`
-   - Node error: `node_start → node_error → run_end(error)`
+   - Node error (bubble): `node_start → node_error → run_end(error)`
+   - Node retry (ADR 0012): each attempt emits `node_start → node_error`
+     with Metadata `attempt`, `max_attempts`, `will_retry`; successful
+     attempt then follows the success sequence
+   - on_error divert: `node_error(will_retry=false) → route(reason=on_error) → checkpoint → …`;
+     if the run later ends without a bubbled error, `run_end` has no Err
+     (State may carry `status=failed`)
    - Checkpoint error: `… → checkpoint_error → run_end(error)`
    - Cancel / max steps: always terminate with `run_end`
    - Resume: `run_resume` then same per-node sequence; new `RunID`, same

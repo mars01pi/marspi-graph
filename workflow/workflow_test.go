@@ -240,6 +240,111 @@ func TestDevflowHITLDeny(t *testing.T) {
 	}
 }
 
+func TestRetryOnErrorSoftComplete(t *testing.T) {
+	var calls int
+	spec, err := workflow.ParseSpec([]byte(`
+id: ft
+entry: work
+nodes:
+  - id: work
+    component: agent
+    retry:
+      max_attempts: 2
+      initial_interval: 1ms
+      jitter: false
+    on_error: sink
+  - id: sink
+    component: agent
+edges:
+  - from: work
+    to: END
+  - from: sink
+    to: END
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := workflow.Run(context.Background(), spec, workflow.Bindings{
+		Goal:     "x",
+		MaxSteps: 10,
+		NodeRun: map[string]graph.NodeFunc{
+			"work": func(_ context.Context, _ graph.State) (graph.Update, error) {
+				calls++
+				return nil, errors.New("hard")
+			},
+			"sink": func(_ context.Context, s graph.State) (graph.Update, error) {
+				return graph.Update{"handled": true}, nil
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("soft complete want nil, got %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("calls=%d want 2", calls)
+	}
+	if res.State.GetString(graph.StateKeyStatus) != graph.StatusFailed {
+		t.Fatalf("status=%q message=%q", res.State.GetString(graph.StateKeyStatus), res.Message)
+	}
+	if res.Message != graph.StatusFailed {
+		t.Fatalf("Message=%q want failed", res.Message)
+	}
+	if res.State["handled"] != true {
+		t.Fatalf("sink not run: %v", res.State)
+	}
+	if res.State.GetString(graph.StateKeyErrorNode) != "work" {
+		t.Fatalf("error_node=%q", res.State.GetString(graph.StateKeyErrorNode))
+	}
+}
+
+func TestValidateOnErrorUnknown(t *testing.T) {
+	_, err := workflow.ParseSpec([]byte(`
+id: x
+entry: a
+nodes:
+  - id: a
+    component: agent
+    on_error: missing
+edges:
+  - from: a
+    to: END
+`))
+	if err == nil || !strings.Contains(err.Error(), "on_error") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestRetryWithoutOnErrorBubbles(t *testing.T) {
+	spec, err := workflow.ParseSpec([]byte(`
+id: ft
+entry: work
+nodes:
+  - id: work
+    component: agent
+    retry:
+      max_attempts: 2
+      initial_interval: 1ms
+      jitter: false
+edges:
+  - from: work
+    to: END
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = workflow.Run(context.Background(), spec, workflow.Bindings{
+		MaxSteps: 5,
+		NodeRun: map[string]graph.NodeFunc{
+			"work": func(_ context.Context, _ graph.State) (graph.Update, error) {
+				return nil, errors.New("boom")
+			},
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "boom") {
+		t.Fatalf("want bubble, got %v", err)
+	}
+}
+
 func stubPhase(id string, extra graph.Update) graph.NodeFunc {
 	return func(_ context.Context, _ graph.State) (graph.Update, error) {
 		upd := graph.Update{"phase": id, "last_agent": id}

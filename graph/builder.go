@@ -13,6 +13,8 @@ import (
 type Builder struct {
 	mu       sync.Mutex
 	nodes    map[string]NodeFunc
+	retries  map[string]RetryPolicy
+	onErrors map[string]string // from -> on_error target
 	edges    map[string]string // fixed: from -> to
 	routes   map[string]RouteFunc
 	reducers map[string]Reducer
@@ -24,14 +26,16 @@ type Builder struct {
 func NewBuilder() *Builder {
 	return &Builder{
 		nodes:    map[string]NodeFunc{},
+		retries:  map[string]RetryPolicy{},
+		onErrors: map[string]string{},
 		edges:    map[string]string{},
 		routes:   map[string]RouteFunc{},
 		reducers: map[string]Reducer{},
 	}
 }
 
-// AddNode registers a named node.
-func (b *Builder) AddNode(name string, fn NodeFunc) *Builder {
+// AddNode registers a named node. Optional NodeOption values configure retry.
+func (b *Builder) AddNode(name string, fn NodeFunc, opts ...NodeOption) *Builder {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.err != nil {
@@ -49,7 +53,40 @@ func (b *Builder) AddNode(name string, fn NodeFunc) *Builder {
 		b.err = fmt.Errorf("graph: nil node func: %q", name)
 		return b
 	}
+	var nc nodeConfig
+	for _, o := range opts {
+		if o != nil {
+			o(&nc)
+		}
+	}
 	b.nodes[name] = fn
+	if nc.hasRetry {
+		b.retries[name] = nc.retry
+	}
+	return b
+}
+
+// SetOnError registers a side edge taken after retries are exhausted.
+// It may coexist with a fixed edge or conditional route from the same node.
+func (b *Builder) SetOnError(from, to string) *Builder {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.err != nil {
+		return b
+	}
+	if from == "" || from == START || from == END {
+		b.err = fmt.Errorf("graph: invalid on_error from: %q", from)
+		return b
+	}
+	if to == "" {
+		b.err = fmt.Errorf("graph: empty on_error to from %q", from)
+		return b
+	}
+	if _, ok := b.onErrors[from]; ok {
+		b.err = fmt.Errorf("graph: duplicate on_error for %q", from)
+		return b
+	}
+	b.onErrors[from] = to
 	return b
 }
 
@@ -159,6 +196,16 @@ func (b *Builder) Compile(opts ...CompileOption) (*Compiled, error) {
 			return nil, fmt.Errorf("graph: route from unknown node %q", from)
 		}
 	}
+	for from, to := range b.onErrors {
+		if _, ok := b.nodes[from]; !ok {
+			return nil, fmt.Errorf("graph: on_error from unknown node %q", from)
+		}
+		if to != END {
+			if _, ok := b.nodes[to]; !ok {
+				return nil, fmt.Errorf("graph: on_error to unknown node %q", to)
+			}
+		}
+	}
 
 	nodes := make(map[string]NodeFunc, len(b.nodes))
 	for k, v := range b.nodes {
@@ -176,6 +223,14 @@ func (b *Builder) Compile(opts ...CompileOption) (*Compiled, error) {
 	for k, v := range b.reducers {
 		reducers[k] = v
 	}
+	retries := make(map[string]RetryPolicy, len(b.retries))
+	for k, v := range b.retries {
+		retries[k] = v
+	}
+	onErrors := make(map[string]string, len(b.onErrors))
+	for k, v := range b.onErrors {
+		onErrors[k] = v
+	}
 
 	leaseTTL := cfg.leaseTTL
 	if leaseTTL <= 0 {
@@ -191,6 +246,8 @@ func (b *Builder) Compile(opts ...CompileOption) (*Compiled, error) {
 		edges:               edges,
 		routes:              routes,
 		reducers:            reducers,
+		retries:             retries,
+		onErrors:            onErrors,
 		entry:               b.entry,
 		checkpointer:        cfg.checkpointer,
 		durable:             cfg.durable,
@@ -273,6 +330,8 @@ type Compiled struct {
 	edges               map[string]string
 	routes              map[string]RouteFunc
 	reducers            map[string]Reducer
+	retries             map[string]RetryPolicy
+	onErrors            map[string]string
 	entry               string
 	checkpointer        Checkpointer
 	durable             DurableCheckpointer
@@ -592,50 +651,146 @@ func (g *Compiled) run(ctx context.Context, state State, node string, step int, 
 			return state, fmt.Errorf("graph: unknown node %q", node)
 		}
 
-		nodeCtx := WithNodeID(ctx, node)
-		nodeCtx = WithParentCheckpointID(nodeCtx, parent)
-		if cfg.leaseSess != nil {
-			nodeCtx = WithLeaseGrant(nodeCtx, cfg.leaseSess.get())
+		policy, hasRetry := g.retries[node]
+		if hasRetry {
+			policy = policy.Normalize()
+		} else {
+			policy = RetryPolicy{MaxAttempts: 1}.Normalize()
 		}
-		nodeCtx, collector := WithStepArtifacts(nodeCtx)
+		onErrorTo, hasOnError := g.onErrors[node]
 
-		g.emit(nodeCtx, cfg, Event{Type: EventNodeStart, NodeID: node, Step: step, CheckpointID: parent})
+		var (
+			upd       Update
+			err       error
+			collector *artifactCollector
+			nodeCtx   context.Context
+		)
 
-		upd, err := callNode(fn, nodeCtx, state)
-		if lost := leaseLostFrom(ctx); lost != nil {
-			// Discard update/artifacts after heartbeat loss.
-			return state, lost
+		for attempt := 1; attempt <= policy.MaxAttempts; attempt++ {
+			nodeCtx = WithNodeID(ctx, node)
+			nodeCtx = WithParentCheckpointID(nodeCtx, parent)
+			nodeCtx = WithAttempt(nodeCtx, attempt)
+			if cfg.leaseSess != nil {
+				nodeCtx = WithLeaseGrant(nodeCtx, cfg.leaseSess.get())
+			}
+			nodeCtx, collector = WithStepArtifacts(nodeCtx)
+
+			g.emit(nodeCtx, cfg, Event{
+				Type:         EventNodeStart,
+				NodeID:       node,
+				Step:         step,
+				CheckpointID: parent,
+				Metadata:     map[string]string{"attempt": fmt.Sprintf("%d", attempt), "max_attempts": fmt.Sprintf("%d", policy.MaxAttempts)},
+			})
+
+			upd, err = callNode(fn, nodeCtx, state)
+			if lost := leaseLostFrom(ctx); lost != nil {
+				return state, lost
+			}
+			if ie, ok := AsInterrupt(err); ok {
+				ie.Node = node
+				if !g.hasStore() {
+					g.emit(nodeCtx, cfg, Event{Type: EventNodeError, NodeID: node, Step: step, Err: ie})
+					return state, fmt.Errorf("graph: interrupt at %q requires a checkpointer: %w", node, ie)
+				}
+				snap := Snapshot{
+					CheckpointID:       NewID(),
+					ParentCheckpointID: parent,
+					ThreadID:           cfg.threadID,
+					Node:               node,
+					CurrentNode:        node,
+					State:              state.Clone(),
+					Step:               step,
+					Interrupt:          true,
+					InterruptValue:     ie.Value,
+					CreatedAt:          time.Now().UTC(),
+				}
+				arts := collector.snapshot()
+				if putErr := g.persist(nodeCtx, cfg, snap, arts); putErr != nil {
+					g.emit(nodeCtx, cfg, Event{Type: EventCheckpointError, NodeID: node, Step: step, CheckpointID: snap.CheckpointID, Err: putErr})
+					return state, putErr
+				}
+				parent = snap.CheckpointID
+				g.emit(nodeCtx, cfg, Event{Type: EventCheckpoint, NodeID: node, Step: step, CheckpointID: snap.CheckpointID, Metadata: map[string]string{"interrupt": "true", "current": node}})
+				g.emit(nodeCtx, cfg, Event{Type: EventInterrupt, NodeID: node, Step: step, CheckpointID: snap.CheckpointID})
+				return state, ie
+			}
+			if err == nil {
+				break
+			}
+
+			willRetry := policy.shouldRetry(err, attempt)
+			meta := map[string]string{
+				"attempt":      fmt.Sprintf("%d", attempt),
+				"max_attempts": fmt.Sprintf("%d", policy.MaxAttempts),
+				"will_retry":   fmt.Sprintf("%t", willRetry),
+			}
+			g.emit(nodeCtx, cfg, Event{Type: EventNodeError, NodeID: node, Step: step, Err: err, Metadata: meta})
+			if !willRetry {
+				break
+			}
+			delay := policy.backoff(attempt)
+			if delay > 0 {
+				timer := time.NewTimer(delay)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					if lost := leaseLostFrom(ctx); lost != nil {
+						return state, lost
+					}
+					return state, ctx.Err()
+				case <-timer.C:
+				}
+			}
 		}
-		if ie, ok := AsInterrupt(err); ok {
-			ie.Node = node
-			if !g.hasStore() {
-				g.emit(nodeCtx, cfg, Event{Type: EventNodeError, NodeID: node, Step: step, Err: ie})
-				return state, fmt.Errorf("graph: interrupt at %q requires a checkpointer: %w", node, ie)
-			}
-			snap := Snapshot{
-				CheckpointID:       NewID(),
-				ParentCheckpointID: parent,
-				ThreadID:           cfg.threadID,
-				Node:               node, // re-enter same node on Resume
-				CurrentNode:        node,
-				State:              state.Clone(),
-				Step:               step,
-				Interrupt:          true,
-				InterruptValue:     ie.Value,
-				CreatedAt:          time.Now().UTC(),
-			}
-			arts := collector.snapshot()
-			if putErr := g.persist(nodeCtx, cfg, snap, arts); putErr != nil {
-				g.emit(nodeCtx, cfg, Event{Type: EventCheckpointError, NodeID: node, Step: step, CheckpointID: snap.CheckpointID, Err: putErr})
-				return state, putErr
-			}
-			parent = snap.CheckpointID
-			g.emit(nodeCtx, cfg, Event{Type: EventCheckpoint, NodeID: node, Step: step, CheckpointID: snap.CheckpointID, Metadata: map[string]string{"interrupt": "true", "current": node}})
-			g.emit(nodeCtx, cfg, Event{Type: EventInterrupt, NodeID: node, Step: step, CheckpointID: snap.CheckpointID})
-			return state, ie
-		}
+
 		if err != nil {
-			g.emit(nodeCtx, cfg, Event{Type: EventNodeError, NodeID: node, Step: step, Err: err})
+			if hasOnError {
+				state = Apply(state, Update{
+					StateKeyErrorNode: node,
+					StateKeyLastError: FormatEventErr(err),
+					StateKeyStatus:    StatusFailed,
+				}, g.reducers)
+				step++
+				ctx = context.WithValue(ctx, resumeCtxKey{}, nil)
+				next := onErrorTo
+				if next == "" {
+					next = END
+				}
+				g.emit(nodeCtx, cfg, Event{
+					Type:         EventRoute,
+					NodeID:       node,
+					Step:         step,
+					CheckpointID: parent,
+					Metadata:     map[string]string{"from": node, "to": next, "reason": "on_error"},
+				})
+				if g.hasStore() {
+					snap := Snapshot{
+						CheckpointID:       NewID(),
+						ParentCheckpointID: parent,
+						ThreadID:           cfg.threadID,
+						Node:               next,
+						CurrentNode:        node,
+						State:              state.Clone(),
+						Step:               step,
+						Interrupt:          false,
+						CreatedAt:          time.Now().UTC(),
+					}
+					// Failed attempts discard artifacts; divert checkpoint has none.
+					if putErr := g.persist(nodeCtx, cfg, snap, nil); putErr != nil {
+						g.emit(nodeCtx, cfg, Event{Type: EventCheckpointError, NodeID: node, Step: step, CheckpointID: snap.CheckpointID, Err: putErr})
+						return state, putErr
+					}
+					parent = snap.CheckpointID
+					ctx = WithParentCheckpointID(ctx, parent)
+					g.emit(nodeCtx, cfg, Event{Type: EventCheckpoint, NodeID: node, Step: step, CheckpointID: snap.CheckpointID, Metadata: map[string]string{"next": next, "current": node, "reason": "on_error"}})
+				}
+				node = next
+				if cfg.maxSteps > 0 && step >= cfg.maxSteps {
+					return state, fmt.Errorf("graph: max steps %d exceeded", cfg.maxSteps)
+				}
+				continue
+			}
 			return state, fmt.Errorf("graph: node %q: %w", node, err)
 		}
 
@@ -647,9 +802,9 @@ func (g *Compiled) run(ctx context.Context, state State, node string, step int, 
 		// Clear one-shot resume value after a successful node re-entry.
 		ctx = context.WithValue(ctx, resumeCtxKey{}, nil)
 
-		next, err := g.next(ctx, node, state)
-		if err != nil {
-			return state, err
+		next, nerr := g.next(ctx, node, state)
+		if nerr != nil {
+			return state, nerr
 		}
 		g.emit(nodeCtx, cfg, Event{
 			Type:         EventRoute,

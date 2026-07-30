@@ -33,6 +33,21 @@ type NodeSpec struct {
 	Bindings  map[string]any `json:"bindings,omitempty" yaml:"bindings,omitempty"`
 	// Kind is a deprecated alias for Component (interrupt_gate → approval).
 	Kind string `json:"kind,omitempty" yaml:"kind,omitempty"`
+
+	// Retry configures graph.RetryPolicy for hard node errors (ADR 0012).
+	Retry *RetrySpec `json:"retry,omitempty" yaml:"retry,omitempty"`
+	// OnError is a side-edge target after retries are exhausted (node id or END).
+	OnError string `json:"on_error,omitempty" yaml:"on_error,omitempty"`
+}
+
+// RetrySpec is the serializable subset of graph.RetryPolicy.
+type RetrySpec struct {
+	MaxAttempts     int    `json:"max_attempts,omitempty" yaml:"max_attempts,omitempty"`
+	InitialInterval string `json:"initial_interval,omitempty" yaml:"initial_interval,omitempty"`
+	BackoffFactor   float64 `json:"backoff_factor,omitempty" yaml:"backoff_factor,omitempty"`
+	MaxInterval     string `json:"max_interval,omitempty" yaml:"max_interval,omitempty"`
+	// Jitter defaults to true when Retry is present and this pointer is nil.
+	Jitter *bool `json:"jitter,omitempty" yaml:"jitter,omitempty"`
 }
 
 // EdgeSpec is a fixed edge or a named conditional route.
@@ -121,10 +136,21 @@ func (s Spec) Validate() error {
 		if err := c.Bind(n.Bindings); err != nil {
 			return fmt.Errorf("workflow: node %q bindings: %w", id, err)
 		}
+		if n.Retry != nil && n.Retry.MaxAttempts < 0 {
+			return fmt.Errorf("workflow: node %q retry.max_attempts must be >= 0", id)
+		}
 		nodes[id] = n
 	}
 	if _, ok := nodes[s.Entry]; !ok {
 		return fmt.Errorf("workflow: entry %q not found", s.Entry)
+	}
+	for _, n := range s.Nodes {
+		if n.OnError == "" {
+			continue
+		}
+		if err := checkTarget(nodes, n.OnError); err != nil {
+			return fmt.Errorf("workflow: node %q on_error: %w", n.ID, err)
+		}
 	}
 	for key, r := range s.Reducers {
 		if r != "append_slice" {

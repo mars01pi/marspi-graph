@@ -99,16 +99,31 @@ func CompileWorkflow(spec Spec, b Bindings) (*graph.Compiled, error) {
 
 	for _, n := range spec.Nodes {
 		n := n
+		var nodeOpts []graph.NodeOption
+		if n.Retry != nil {
+			pol, err := retryPolicyFromSpec(n.Retry)
+			if err != nil {
+				return nil, fmt.Errorf("workflow: node %q retry: %w", n.ID, err)
+			}
+			nodeOpts = append(nodeOpts, graph.WithRetry(pol))
+		}
 		if override, ok := b.NodeRun[n.ID]; ok && override != nil {
-			builder.AddNode(n.ID, override)
-			continue
+			builder.AddNode(n.ID, override, nodeOpts...)
+		} else {
+			h := failHooks[n.ID]
+			fn, err := buildNode(n, b, h, idx)
+			if err != nil {
+				return nil, err
+			}
+			builder.AddNode(n.ID, fn, nodeOpts...)
 		}
-		h := failHooks[n.ID]
-		fn, err := buildNode(n, b, h, idx)
-		if err != nil {
-			return nil, err
+		if n.OnError != "" {
+			to := n.OnError
+			if to == "END" {
+				to = graph.END
+			}
+			builder.SetOnError(n.ID, to)
 		}
-		builder.AddNode(n.ID, fn)
 	}
 
 	builder.SetEntry(spec.Entry)
@@ -145,6 +160,9 @@ func applyAllowPush(spec Spec, allowPush bool) Spec {
 	for _, n := range spec.Nodes {
 		if skip[n.ID] {
 			continue
+		}
+		if skip[n.OnError] {
+			n.OnError = "END"
 		}
 		nodes = append(nodes, n)
 	}
@@ -202,6 +220,39 @@ func failHooksByNode(edges []EdgeSpec) map[string]failHook {
 		}
 	}
 	return out
+}
+
+func retryPolicyFromSpec(r *RetrySpec) (graph.RetryPolicy, error) {
+	if r == nil {
+		return graph.RetryPolicy{}, nil
+	}
+	p := graph.RetryPolicy{
+		MaxAttempts:   r.MaxAttempts,
+		BackoffFactor: r.BackoffFactor,
+	}
+	if r.MaxAttempts == 0 {
+		p.MaxAttempts = 3
+	}
+	if r.InitialInterval != "" {
+		d, err := time.ParseDuration(r.InitialInterval)
+		if err != nil {
+			return graph.RetryPolicy{}, fmt.Errorf("initial_interval: %w", err)
+		}
+		p.InitialInterval = d
+	}
+	if r.MaxInterval != "" {
+		d, err := time.ParseDuration(r.MaxInterval)
+		if err != nil {
+			return graph.RetryPolicy{}, fmt.Errorf("max_interval: %w", err)
+		}
+		p.MaxInterval = d
+	}
+	if r.Jitter == nil {
+		p.Jitter = true
+	} else {
+		p.Jitter = *r.Jitter
+	}
+	return p.Normalize(), nil
 }
 
 func compileOpts(b Bindings) ([]graph.CompileOption, error) {
