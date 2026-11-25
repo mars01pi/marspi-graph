@@ -9,6 +9,8 @@
 Depends on [`marspi-core`](../marspi-core) for the single-agent ReAct runtime.
 Consumed by `marspi-cli` (and later platform services).
 
+Core 依赖锁定到 `go.mod` 中的 GitHub 提交版本，独立检出即可构建，无需相邻的本地 Core 目录。Graph 只依赖工具协议和注册表，具体文件、Shell 等能力由宿主显式注册：`tool.NewEmptyRegistry(host)` → `Register(...)` → 注入 AgentSpec。Spawn 的工具隔离测试使用测试工具，不加载 CLI 默认工具集。
+
 ---
 
 ## 📦 Packages

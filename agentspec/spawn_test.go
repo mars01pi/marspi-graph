@@ -12,8 +12,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mars/marspi-core/config"
-	"github.com/mars/marspi-core/console"
 	"github.com/mars/marspi-core/llm"
 	"github.com/mars/marspi-core/tool"
 	"github.com/mars/marspi-graph/agentspec"
@@ -243,8 +241,9 @@ func TestSpawnContextIsolation(t *testing.T) {
 }
 
 func TestSpawnAllowTools(t *testing.T) {
-	cfg := &config.Config{ProjectRoot: t.TempDir()}
-	full := tool.NewRegistry(cfg, console.Nop{}, nil, nil)
+	full := emptyRegistry(t)
+	full.Register(spawnFixtureTool{name: "read"})
+	full.Register(spawnFixtureTool{name: "write"})
 	names := full.Names()
 	hasRead, hasWrite := false, false
 	for _, n := range names {
@@ -256,7 +255,7 @@ func TestSpawnAllowTools(t *testing.T) {
 		}
 	}
 	if !hasRead || !hasWrite {
-		t.Fatalf("expected read/write builtins, got %v", names)
+		t.Fatalf("expected read/write fixtures, got %v", names)
 	}
 
 	var toolNames atomic.Value
@@ -537,12 +536,18 @@ func TestSpawnAsNodeIntegration(t *testing.T) {
 
 func emptyRegistry(t *testing.T) *tool.Registry {
 	t.Helper()
-	cfg := &config.Config{ProjectRoot: t.TempDir()}
-	reg := tool.NewRegistry(cfg, console.Nop{}, nil, nil)
-	// Start from full registry then clear via View of empty? View empty allowlist
-	// returns all tools. Build a fresh registry by registering only what we need:
-	// NewRegistry always fills builtins — fine for spawn registration tests.
-	return reg
+	return tool.NewEmptyRegistry(nil)
+}
+
+type spawnFixtureTool struct {
+	tool.Base
+	name string
+}
+
+func (fixture spawnFixtureTool) Name() string        { return fixture.name }
+func (fixture spawnFixtureTool) Description() string { return fixture.name }
+func (fixture spawnFixtureTool) Run(map[string]any) tool.Result {
+	return tool.OK("fixture result")
 }
 
 func runSpawn(t *testing.T, reg *tool.Registry, args map[string]any) tool.Result {

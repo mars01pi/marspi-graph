@@ -4,7 +4,7 @@ go 1.25.0
 
 require (
 	github.com/go-sql-driver/mysql v1.9.3
-	github.com/mars/marspi-core v0.0.0
+	github.com/mars/marspi-core v1.0.1-0.20261125110845-2be440352835
 	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.53.0
 )
@@ -22,4 +22,4 @@ require (
 	modernc.org/memory v1.11.0 // indirect
 )
 
-replace github.com/mars/marspi-core => ../marspi-core
+replace github.com/mars/marspi-core => github.com/mars01pi/marspi-core v1.0.1-0.20261125110845-2be440352835
